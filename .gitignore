@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+etf_crash.log
+etf_runtime.log
+downloads/
+*.tmp
+
