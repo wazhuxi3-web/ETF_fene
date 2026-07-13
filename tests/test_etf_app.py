@@ -298,7 +298,7 @@ Redemption=1
 Publish=1
 CreationRedemptionUnit=1000000
 TAGTAG
-300001|特锐德|100|1|0.1|0.2|12.5|12.5|102
+300001|特锐德|100|1|0.1|12.5|12.5|XSHE
 ENDENDEND
 """
 
@@ -310,6 +310,44 @@ ENDENDEND
         self.assertEqual(items[0]["证券代码"], "300001")
         self.assertEqual(items[0]["挂牌市场"], "SZSE")
         self.assertEqual(items[0]["替代金额"], 12.5)
+        self.assertEqual(mismatches, 0)
+
+    def test_parses_eight_field_legacy_amounts_and_exchange_codes(self):
+        legacy = """Version=2.0
+SecurityID=159915
+TradingDay=20260714
+TAGTAG
+300001|特锐德|100|1|0.1|10|12|XSHE
+600000|浦发银行|200|1|0.2|20|20|XSHG
+ENDENDEND
+"""
+
+        info, items, mismatches = parse_szse_pcf_download(legacy)
+
+        self.assertEqual(info["基金代码"], "159915")
+        self.assertEqual(items[0]["替代金额"], 10.0)
+        self.assertEqual(items[0]["挂牌市场"], "SZSE")
+        self.assertEqual(items[1]["替代金额"], 20.0)
+        self.assertEqual(items[1]["挂牌市场"], "SSE")
+        self.assertEqual(mismatches, 1)
+
+    def test_legacy_header_keys_and_detection_are_case_insensitive(self):
+        legacy = """vErSiOn=2.0
+sEcUrItYiD=159915
+FuNdNaMe=创业板ETF
+SyMbOl=兼容名称
+tRaDiNgDaY=20260714
+TaGtAg
+300001|特锐德|100|1|0.1|12.5|12.5|xShE
+EnDeNdEnD
+"""
+
+        info, items, mismatches = parse_szse_pcf_download(legacy)
+
+        self.assertEqual(info["基金代码"], "159915")
+        self.assertEqual(info["基金名称"], "创业板ETF")
+        self.assertEqual(info["内容日期"], "2026-07-14")
+        self.assertEqual(items[0]["挂牌市场"], "SZSE")
         self.assertEqual(mismatches, 0)
 
     def test_parses_namespaced_xml_and_normalizes_exchange_fields(self):

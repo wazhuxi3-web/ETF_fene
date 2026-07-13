@@ -70,10 +70,13 @@ def _allowance_value(value) -> str:
 
 
 def _market_name(value):
+    key = str(value or "").strip().casefold()
     return {
         "101": "SSE",
         "102": "SZSE",
-    }.get(str(value or "").strip(), _clean_text(value))
+        "xshg": "SSE",
+        "xshe": "SZSE",
+    }.get(key, _clean_text(value))
 
 
 def choose_szse_substitute_amount(creation, redemption) -> tuple[float | None, bool]:
@@ -160,47 +163,49 @@ def _parse_szse_legacy(text: str) -> tuple[dict, list[dict], int]:
     in_components = False
     for line in text.replace("\r", "").split("\n"):
         stripped = line.strip()
-        if stripped == "TAGTAG":
+        if stripped.casefold() == "tagtag":
             in_components = True
             continue
         if not in_components:
             if "=" in line:
                 key, value = line.split("=", 1)
-                header[key.strip()] = value.strip()
-        elif stripped and stripped not in {"ENDENDEND", "END"}:
+                header[key.strip().casefold()] = value.strip()
+        elif stripped and stripped.casefold() not in {"endendend", "end"}:
             component_lines.append(line)
 
-    code = _clean_text(header.get("SecurityID") or header.get("Fundid1") or header.get("FundID"))
-    content_date = _format_date(header.get("TradingDay"))
+    code = _clean_text(
+        header.get("securityid") or header.get("fundid1") or header.get("fundid")
+    )
+    content_date = _format_date(header.get("tradingday"))
     raw_info = {
         "交易所": "SZSE",
         "基金代码": code,
-        "基金名称": header.get("Symbol"),
-        "基金管理公司名称": header.get("FundManagementCompany"),
+        "基金名称": header.get("fundname") or header.get("symbol"),
+        "基金管理公司名称": header.get("fundmanagementcompany"),
         "最新公告日期": content_date,
         "内容日期": content_date,
-        "现金差额": header.get("CashComponent"),
-        "最小申购、赎回单位净值": header.get("NAVperCU"),
-        "基金份额净值": header.get("NAV"),
-        "最小申购、赎回单位的预估现金部分": header.get("EstimateCashComponent"),
-        "现金替代比例上限": header.get("MaxCashRatio"),
-        "当日累计可申购的基金份额上限": header.get("CreationLimit"),
-        "当日累计可赎回的基金份额上限": header.get("RedemptionLimit"),
-        "当日净申购的基金份额上限": header.get("NetCreationLimit"),
-        "当日净赎回的基金份额上限": header.get("NetRedemptionLimit"),
-        "单个证券账户当日累计可申购的基金份额上限": header.get("CreationLimitPerUser"),
-        "单个证券账户当日累计可赎回的基金份额上限": header.get("RedemptionLimitPerUser"),
-        "单个证券账户当日净申购的基金份额上限": header.get("NetCreationLimitPerUser"),
-        "单个证券账户当日净赎回的基金份额上限": header.get("NetRedemptionLimitPerUser"),
-        "是否需要公布IOPV": _flag_text(header.get("Publish")),
-        "最小申购、赎回单位": header.get("CreationRedemptionUnit"),
+        "现金差额": header.get("cashcomponent"),
+        "最小申购、赎回单位净值": header.get("navpercu"),
+        "基金份额净值": header.get("nav"),
+        "最小申购、赎回单位的预估现金部分": header.get("estimatecashcomponent"),
+        "现金替代比例上限": header.get("maxcashratio"),
+        "当日累计可申购的基金份额上限": header.get("creationlimit"),
+        "当日累计可赎回的基金份额上限": header.get("redemptionlimit"),
+        "当日净申购的基金份额上限": header.get("netcreationlimit"),
+        "当日净赎回的基金份额上限": header.get("netredemptionlimit"),
+        "单个证券账户当日累计可申购的基金份额上限": header.get("creationlimitperuser"),
+        "单个证券账户当日累计可赎回的基金份额上限": header.get("redemptionlimitperuser"),
+        "单个证券账户当日净申购的基金份额上限": header.get("netcreationlimitperuser"),
+        "单个证券账户当日净赎回的基金份额上限": header.get("netredemptionlimitperuser"),
+        "是否需要公布IOPV": _flag_text(header.get("publish")),
+        "最小申购、赎回单位": header.get("creationredemptionunit"),
         "申购赎回的允许情况": (
-            f"申购:{_allowance_value(header.get('Creation'))}；"
-            f"赎回:{_allowance_value(header.get('Redemption'))}"
-            if header.get("Creation") is not None or header.get("Redemption") is not None
+            f"申购:{_allowance_value(header.get('creation'))}；"
+            f"赎回:{_allowance_value(header.get('redemption'))}"
+            if header.get("creation") is not None or header.get("redemption") is not None
             else None
         ),
-        "申购赎回模式": header.get("Type"),
+        "申购赎回模式": header.get("type"),
     }
     info = normalize_pcf_info(raw_info, exchange="SZSE")
 
@@ -208,10 +213,9 @@ def _parse_szse_legacy(text: str) -> tuple[dict, list[dict], int]:
     mismatch_count = 0
     for line in component_lines:
         fields = [field.strip() for field in line.split("|")]
-        if len(fields) < 4 or not fields[0]:
+        if len(fields) < 8 or not fields[0]:
             continue
-        fields += [""] * (9 - len(fields))
-        amount, mismatch = choose_szse_substitute_amount(fields[6], fields[7])
+        amount, mismatch = choose_szse_substitute_amount(fields[5], fields[6])
         mismatch_count += int(mismatch)
         raw_item = {
             "交易所": "SZSE",
@@ -222,9 +226,9 @@ def _parse_szse_legacy(text: str) -> tuple[dict, list[dict], int]:
             "股票数量": fields[2],
             "现金替代标志": fields[3],
             "申购现金替代溢价比例": fields[4],
-            "赎回现金替代折价比例": fields[5],
+            "赎回现金替代折价比例": None,
             "替代金额": amount,
-            "挂牌市场": _market_name(fields[8]),
+            "挂牌市场": _market_name(fields[7]),
         }
         item = normalize_pcf_item(raw_item, exchange="SZSE")
         if item["证券代码"]:
@@ -245,7 +249,8 @@ def parse_szse_pcf_download(raw: bytes | str) -> tuple[dict, list[dict], int]:
     text = _decode_szse_download(raw)
     if text.lstrip().startswith("<"):
         return _parse_szse_xml(text)
-    if "TradingDay=" in text and "TAGTAG" in text:
+    folded = text.casefold()
+    if "tradingday=" in folded and "tagtag" in folded:
         return _parse_szse_legacy(text)
     raise ValueError("深交所 PCF 文件格式无法识别")
 
