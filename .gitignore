@@ -5,3 +5,4 @@ etf_runtime.log
 downloads/
 *.tmp
 .worktrees/
+.superpowers/
