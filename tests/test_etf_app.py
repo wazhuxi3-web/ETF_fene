@@ -39,6 +39,12 @@ from sse_pcf_fetcher import (
     build_sse_pcf_download_url,
     fetch_sse_pcf_for_fund,
 )
+from szse_pcf_fetcher import (
+    SZSEPCFReference,
+    choose_szse_substitute_amount,
+    extract_szse_pcf_references,
+    parse_szse_pcf_download,
+)
 from etf_web_app import ETFWebServer, HTML, parse_web_endpoint
 
 
@@ -219,6 +225,7 @@ ENDENDEND\r
         self.assertEqual(len(items), 1)
         self.assertEqual(len(calls), 4)
 
+
     def test_applies_global_request_interval_to_each_sse_request(self):
         info_payload = 'cb({"result":[{"FUND_NAME":"治理ETF","TRADING_DAY":"20260713","ETF_TYPE":"5"}]})'
         xml = "<SSEPortfolioCompositionFile><FundInstrumentID>510010</FundInstrumentID><TradingDay>20260713</TradingDay><ComponentList><Component><InstrumentID>600009</InstrumentID><Quantity>300</Quantity></Component></ComponentList></SSEPortfolioCompositionFile>"
@@ -267,6 +274,101 @@ ENDENDEND\r
         self.assertEqual(len(calls), 2)
         self.assertIn("FUNDID2=510010", calls[0])
         self.assertIn("fundCode=510010", calls[1])
+
+
+class SZSEPCFParserTests(unittest.TestCase):
+    def test_chooses_substitute_amount_and_counts_mismatches(self):
+        self.assertEqual(choose_szse_substitute_amount("10", "10"), (10.0, False))
+        self.assertEqual(choose_szse_substitute_amount("0", "12"), (12.0, False))
+        self.assertEqual(choose_szse_substitute_amount("10", "12"), (10.0, True))
+
+    def test_parses_legacy_szse_text_with_gb18030_encoding(self):
+        legacy = """Version=2.0
+SecurityID=159915
+Symbol=创业板ETF
+FundManagementCompany=易方达基金
+TradingDay=20260714
+CashComponent=10.5
+NAVperCU=1000000
+NAV=1.25
+EstimateCashComponent=11.5
+MaxCashRatio=0.3
+Creation=1
+Redemption=1
+Publish=1
+CreationRedemptionUnit=1000000
+TAGTAG
+300001|特锐德|100|1|0.1|0.2|12.5|12.5|102
+ENDENDEND
+"""
+
+        info, items, mismatches = parse_szse_pcf_download(legacy.encode("gb18030"))
+
+        self.assertEqual(info["交易所"], "SZSE")
+        self.assertEqual(info["基金代码"], "159915")
+        self.assertEqual(info["内容日期"], "2026-07-14")
+        self.assertEqual(items[0]["证券代码"], "300001")
+        self.assertEqual(items[0]["挂牌市场"], "SZSE")
+        self.assertEqual(items[0]["替代金额"], 12.5)
+        self.assertEqual(mismatches, 0)
+
+    def test_parses_namespaced_xml_and_normalizes_exchange_fields(self):
+        xml = """
+        <PCFFile xmlns="urn:szse:pcf">
+          <SecurityID>159915</SecurityID>
+          <Symbol>创业板ETF</Symbol>
+          <FundManagementCompany>易方达基金</FundManagementCompany>
+          <TradingDay>20260714</TradingDay>
+          <CashComponent>10.5</CashComponent>
+          <NAVperCU>1000000</NAVperCU>
+          <NAV>1.25</NAV>
+          <EstimateCashComponent>11.5</EstimateCashComponent>
+          <MaxCashRatio>0.3</MaxCashRatio>
+          <Creation>1</Creation>
+          <Redemption>1</Redemption>
+          <Publish>1</Publish>
+          <CreationRedemptionUnit>1000000</CreationRedemptionUnit>
+          <ComponentList>
+            <Component>
+              <UnderlyingSecurityID>300001</UnderlyingSecurityID>
+              <UnderlyingSymbol>特锐德</UnderlyingSymbol>
+              <ComponentShare>100</ComponentShare>
+              <SubstituteFlag>1</SubstituteFlag>
+              <PremiumRatio>0.1</PremiumRatio>
+              <DiscountRatio>0.2</DiscountRatio>
+              <CreationCashSubstitute>12.5</CreationCashSubstitute>
+              <RedemptionCashSubstitute>12.5</RedemptionCashSubstitute>
+              <UnderlyingSecurityIDSource>102</UnderlyingSecurityIDSource>
+            </Component>
+          </ComponentList>
+        </PCFFile>
+        """
+
+        info, items, mismatches = parse_szse_pcf_download(xml)
+
+        self.assertEqual(info["交易所"], "SZSE")
+        self.assertEqual(info["基金代码"], "159915")
+        self.assertEqual(info["内容日期"], "2026-07-14")
+        self.assertEqual(items[0]["证券代码"], "300001")
+        self.assertEqual(items[0]["挂牌市场"], "SZSE")
+        self.assertEqual(items[0]["替代金额"], 12.5)
+        self.assertEqual(mismatches, 0)
+
+    def test_extracts_download_references_from_report_payload(self):
+        payload = [{"data": [{"jjdm": (
+            "<a href='/modules/report/views/eft_download_new.html?"
+            "path=%2Ffiles%2Ftext%2FETFDown%2F&"
+            "filename=pcf_159915_20260714%3B159915ETF20260714&"
+            "opencode=ETF15991520260714.txt'>下载</a>"
+        )}]}]
+
+        refs = extract_szse_pcf_references(payload)
+
+        self.assertEqual(
+            refs,
+            [SZSEPCFReference("159915", "2026-07-14", refs[0].download_url)],
+        )
+        self.assertIn("eft_download_new.html", refs[0].download_url)
 
 
 class ParseSSEPayloadTests(unittest.TestCase):
