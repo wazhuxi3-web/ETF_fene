@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import html
+import random
 import re
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from urllib.parse import parse_qs, unquote, urljoin, urlsplit
+from datetime import datetime
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 from sse_pcf_fetcher import normalize_pcf_info, normalize_pcf_item
 
@@ -14,6 +17,12 @@ class SZSEPCFReference:
     fund_code: str
     content_date: str
     download_url: str
+
+
+class SZSEPCFPageError(RuntimeError):
+    def __init__(self, trade_date: str, message: str):
+        super().__init__(message)
+        self.trade_date = trade_date
 
 
 def _clean_text(value) -> str | None:
@@ -291,3 +300,229 @@ def extract_szse_pcf_references(payload: list[dict]) -> list[SZSEPCFReference]:
 
     visit(payload)
     return references
+
+
+def collect_szse_pcf_via_browser(
+    trade_dates: list[str],
+    *,
+    fund_code: str = "",
+    replace_existing: bool = False,
+    is_complete,
+    save_snapshot,
+    on_progress=None,
+    visible: bool = False,
+    session_factory=None,
+    sleep_func=time.sleep,
+    delay_func=lambda: random.uniform(0.8, 1.8),
+) -> dict:
+    """Collect official SZSE PCF files through one reusable browser session."""
+    summary = {
+        "dates": len(trade_dates),
+        "discovered": 0,
+        "skipped": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "items": 0,
+        "mismatched_amounts": 0,
+        "failures": [],
+    }
+    session_factory = session_factory or SZSEPCFBrowserSession
+
+    with session_factory(visible=visible) as session:
+        for trade_date in trade_dates:
+            try:
+                references = session.query(trade_date, fund_code)
+            except Exception as exc:
+                raise SZSEPCFPageError(trade_date, str(exc)) from exc
+
+            summary["discovered"] += len(references)
+            if on_progress:
+                on_progress(f"深交所 PCF {trade_date} 发现 {len(references)} 个文件。")
+
+            for reference in references:
+                if not replace_existing and is_complete(reference.fund_code, reference.content_date):
+                    summary["skipped"] += 1
+                    continue
+
+                last_error = None
+                for attempt, backoff in enumerate((2, 5, 10, None)):
+                    try:
+                        info, items, mismatches = parse_szse_pcf_download(
+                            session.read_file(reference)
+                        )
+                        save_snapshot(info, items)
+                        summary["succeeded"] += 1
+                        summary["items"] += len(items)
+                        summary["mismatched_amounts"] += mismatches
+                        sleep_func(delay_func())
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                        if backoff is not None:
+                            sleep_func(backoff)
+                else:
+                    summary["failed"] += 1
+                    failure = {
+                        "date": trade_date,
+                        "fund_code": reference.fund_code,
+                        "error": str(last_error),
+                    }
+                    summary["failures"].append(failure)
+                    if on_progress:
+                        on_progress(
+                            f"深交所 PCF {trade_date} {reference.fund_code} 下载失败: {last_error}"
+                        )
+
+            if on_progress:
+                on_progress(f"深交所 PCF {trade_date} 采集完成。")
+
+    return summary
+
+
+SZSE_PCF_PAGE_URL = "https://www.szse.cn/disclosure/fund/currency/index.html"
+SZSE_PCF_REPORT_URL = "https://www.szse.cn/api/report/ShowReport/data?CATALOGID=sgshqd"
+
+
+class SZSEPCFBrowserSession:
+    """Browser-backed session for the SZSE PCF report and file redirects."""
+
+    def __init__(self, visible: bool = False):
+        self.visible = visible
+        self._playwright_context = None
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
+
+    def __enter__(self):
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception as exc:
+            raise RuntimeError("缺少 Playwright，无法使用深交所 PCF 浏览器采集。") from exc
+
+        try:
+            self._playwright_context = sync_playwright()
+            self.playwright = self._playwright_context.__enter__()
+            # The default deliberately stays headless: playwright.chromium.launch(headless=not visible)
+            self.browser = self.playwright.chromium.launch(
+                headless=not self.visible, slow_mo=120
+            )
+            self.context = self.browser.new_context()
+            self.page = self.context.new_page()
+            self.page.goto(SZSE_PCF_PAGE_URL, wait_until="networkidle", timeout=60000)
+            return self
+        except Exception:
+            self.__exit__(None, None, None)
+            raise
+
+    def __exit__(self, exc_type, exc, traceback):
+        try:
+            if self.context is not None:
+                self.context.close()
+        finally:
+            try:
+                if self.browser is not None:
+                    self.browser.close()
+            finally:
+                if self._playwright_context is not None:
+                    self._playwright_context.__exit__(exc_type, exc, traceback)
+        self.page = None
+        self.context = None
+        self.browser = None
+        self.playwright = None
+        self._playwright_context = None
+
+    @staticmethod
+    def _report_payloads(first_payload, first_url: str, page_count: int, page) -> list[dict]:
+        payloads = [first_payload]
+        parts = urlsplit(first_url)
+        query = parse_qs(parts.query, keep_blank_values=True)
+        for page_number in range(2, page_count + 1):
+            query["PAGENO"] = [str(page_number)]
+            query["tab1PAGENO"] = [str(page_number)]
+            next_url = urlunsplit(
+                (
+                    parts.scheme,
+                    parts.netloc,
+                    parts.path,
+                    urlencode(query, doseq=True),
+                    parts.fragment,
+                )
+            )
+            payloads.append(
+                page.evaluate(
+                    """async (url) => {
+                        const response = await fetch(url, { credentials: 'include' });
+                        if (!response.ok) throw new Error(`report request failed: ${response.status}`);
+                        return response.json();
+                    }""",
+                    next_url,
+                )
+            )
+        return payloads
+
+    @staticmethod
+    def _as_report_list(payload) -> list[dict]:
+        return payload if isinstance(payload, list) else [payload]
+
+    def query(self, trade_date: str, fund_code: str = "") -> list[SZSEPCFReference]:
+        if self.page is None:
+            raise RuntimeError("深交所 PCF 浏览器会话尚未打开")
+
+        self.page.locator("input.query-txtJCorDH").fill(fund_code)
+        self.page.locator("input.query-txtStart").fill(trade_date)
+        self.page.locator("input.query-txtEnd").fill(trade_date)
+        with self.page.expect_response(
+            lambda response: "CATALOGID=sgshqd" in response.url,
+            timeout=30000,
+        ) as report_info:
+            self.page.locator("button.confirm-query").click()
+        report_response = report_info.value
+        first_payload = report_response.json()
+        report = next(
+            (
+                item
+                for item in self._as_report_list(first_payload)
+                if isinstance(item, dict) and "metadata" in item
+            ),
+            {},
+        )
+        page_count = max(1, int((report.get("metadata") or {}).get("pagecount") or 1))
+        payloads = self._report_payloads(
+            first_payload, report_response.url, page_count, self.page
+        )
+        references = []
+        for payload in payloads:
+            references.extend(extract_szse_pcf_references(self._as_report_list(payload)))
+        return references
+
+    def read_file(self, reference: SZSEPCFReference) -> bytes:
+        if self.context is None:
+            raise RuntimeError("深交所 PCF 浏览器会话尚未打开")
+
+        download_page = self.context.new_page()
+        try:
+            response = download_page.goto(
+                reference.download_url, wait_until="networkidle", timeout=60000
+            )
+            download_page.wait_for_url("**/files/text/ETFDown/**", timeout=30000)
+            if response is None:
+                raise RuntimeError("深交所 PCF 下载未返回文件响应")
+            return response.body()
+        finally:
+            download_page.close()
+
+
+def check_szse_pcf_connection(
+    trade_date: str | None = None, session_factory=None
+) -> tuple[bool, str]:
+    trade_date = trade_date or datetime.now().strftime("%Y-%m-%d")
+    session_factory = session_factory or SZSEPCFBrowserSession
+    try:
+        with session_factory(visible=False) as session:
+            references = session.query(trade_date)
+            if references:
+                session.read_file(references[0])
+        return True, "深交所 PCF 浏览器采集连通，可以继续采集。"
+    except Exception as exc:
+        return False, f"深交所 PCF 浏览器仍未连通: {exc}"

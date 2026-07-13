@@ -41,7 +41,10 @@ from sse_pcf_fetcher import (
 )
 from szse_pcf_fetcher import (
     SZSEPCFReference,
+    SZSEPCFPageError,
+    check_szse_pcf_connection,
     choose_szse_substitute_amount,
+    collect_szse_pcf_via_browser,
     extract_szse_pcf_references,
     parse_szse_pcf_download,
 )
@@ -407,6 +410,174 @@ EnDeNdEnD
             [SZSEPCFReference("159915", "2026-07-14", refs[0].download_url)],
         )
         self.assertIn("eft_download_new.html", refs[0].download_url)
+
+
+class SZSEPCFCollectorTests(unittest.TestCase):
+    xml = b"""<PCFFile>
+      <SecurityID>159915</SecurityID><TradingDay>20260714</TradingDay>
+      <Component><UnderlyingSecurityID>300001</UnderlyingSecurityID>
+      <UnderlyingSymbol>\xe7\x89\xb9\xe9\x94\x90\xe5\xbe\xb7</UnderlyingSymbol><ComponentShare>100</ComponentShare>
+      <SubstituteFlag>1</SubstituteFlag><CreationCashSubstitute>12.5</CreationCashSubstitute>
+      <RedemptionCashSubstitute>12.5</RedemptionCashSubstitute>
+      <UnderlyingSecurityIDSource>102</UnderlyingSecurityIDSource></Component>
+    </PCFFile>"""
+
+    class FakeSession:
+        def __init__(self, references, files):
+            self.references = references
+            self.files = files
+            self.queries = []
+            self.reads = []
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            self.closed = True
+
+        def query(self, trade_date, fund_code=""):
+            self.queries.append((trade_date, fund_code))
+            return self.references
+
+        def read_file(self, reference):
+            self.reads.append(reference)
+            value = self.files[reference.fund_code]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+    def test_collects_unfinished_references_through_one_session(self):
+        references = [
+            SZSEPCFReference("159001", "2026-07-14", "https://example.test/159001"),
+            SZSEPCFReference("159915", "2026-07-14", "https://example.test/159915"),
+        ]
+        fake_session = self.FakeSession(
+            references, {"159001": self.xml, "159915": self.xml}
+        )
+        saved = []
+        sleeps = []
+
+        def save_snapshot(info, items):
+            saved.append((info, items))
+
+        summary = collect_szse_pcf_via_browser(
+            ["2026-07-14"],
+            is_complete=lambda code, date: code == "159001",
+            save_snapshot=save_snapshot,
+            session_factory=lambda visible=False: fake_session,
+            sleep_func=lambda seconds: sleeps.append(seconds),
+            delay_func=lambda: 0.8,
+        )
+
+        self.assertEqual(summary["dates"], 1)
+        self.assertEqual(summary["discovered"], 2)
+        self.assertEqual(summary["skipped"], 1)
+        self.assertEqual(summary["succeeded"], 1)
+        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(summary["items"], 1)
+        self.assertEqual(summary["mismatched_amounts"], 0)
+        self.assertEqual(summary["failures"], [])
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(fake_session.queries, [("2026-07-14", "")])
+        self.assertEqual([ref.fund_code for ref in fake_session.reads], ["159915"])
+        self.assertEqual(sleeps, [0.8])
+        self.assertTrue(fake_session.closed)
+
+    def test_replace_existing_ignores_completed_snapshot(self):
+        reference = SZSEPCFReference("159915", "2026-07-14", "https://example.test/159915")
+        fake_session = self.FakeSession([reference], {"159915": self.xml})
+        saved = []
+
+        summary = collect_szse_pcf_via_browser(
+            ["2026-07-14"],
+            replace_existing=True,
+            is_complete=lambda code, date: True,
+            save_snapshot=lambda info, items: saved.append((info, items)),
+            session_factory=lambda visible=False: fake_session,
+            sleep_func=lambda seconds: None,
+            delay_func=lambda: 0.8,
+        )
+
+        self.assertEqual(summary["skipped"], 0)
+        self.assertEqual(summary["succeeded"], 1)
+        self.assertEqual(len(saved), 1)
+
+    def test_retries_file_failures_and_continues_to_later_references(self):
+        references = [
+            SZSEPCFReference("159001", "2026-07-14", "https://example.test/159001"),
+            SZSEPCFReference("159915", "2026-07-14", "https://example.test/159915"),
+        ]
+        fake_session = self.FakeSession(
+            references,
+            {"159001": RuntimeError("download failed"), "159915": self.xml},
+        )
+        saved = []
+        sleeps = []
+
+        summary = collect_szse_pcf_via_browser(
+            ["2026-07-14"],
+            is_complete=lambda code, date: False,
+            save_snapshot=lambda info, items: saved.append((info, items)),
+            session_factory=lambda visible=False: fake_session,
+            sleep_func=lambda seconds: sleeps.append(seconds),
+            delay_func=lambda: 0.8,
+        )
+
+        self.assertEqual(summary["succeeded"], 1)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(len(summary["failures"]), 1)
+        self.assertEqual([ref.fund_code for ref in fake_session.reads], ["159001"] * 4 + ["159915"])
+        self.assertEqual(sleeps, [2, 5, 10, 0.8])
+        self.assertEqual(len(saved), 1)
+
+    def test_wraps_query_failure_with_the_current_trade_date(self):
+        fake_session = self.FakeSession([], {})
+
+        def fail_query(trade_date, fund_code=""):
+            raise RuntimeError("report unavailable")
+
+        fake_session.query = fail_query
+
+        with self.assertRaisesRegex(SZSEPCFPageError, "report unavailable") as caught:
+            collect_szse_pcf_via_browser(
+                ["2026-07-14", "2026-07-15"],
+                is_complete=lambda code, date: False,
+                save_snapshot=lambda info, items: None,
+                session_factory=lambda visible=False: fake_session,
+            )
+
+        self.assertEqual(caught.exception.trade_date, "2026-07-14")
+        self.assertTrue(fake_session.closed)
+
+    def test_browser_session_uses_the_official_pcf_page_and_hidden_browser(self):
+        source = Path("szse_pcf_fetcher.py").read_text(encoding="utf-8")
+
+        self.assertIn("playwright.chromium.launch(headless=not visible)", source)
+        self.assertIn("input.query-txtJCorDH", source)
+        self.assertIn("input.query-txtStart", source)
+        self.assertIn("input.query-txtEnd", source)
+        self.assertIn("button.confirm-query", source)
+        self.assertIn("CATALOGID=sgshqd", source)
+
+    def test_connection_probe_reads_only_the_first_reference(self):
+        references = [
+            SZSEPCFReference("159915", "2026-07-14", "https://example.test/159915"),
+            SZSEPCFReference("159001", "2026-07-14", "https://example.test/159001"),
+        ]
+        fake_session = self.FakeSession(
+            references, {"159915": self.xml, "159001": self.xml}
+        )
+
+        ok, message = check_szse_pcf_connection(
+            "2026-07-14", session_factory=lambda visible=False: fake_session
+        )
+
+        self.assertTrue(ok)
+        self.assertIn("浏览器采集", message)
+        self.assertEqual(fake_session.queries, [("2026-07-14", "")])
+        self.assertEqual([ref.fund_code for ref in fake_session.reads], ["159915"])
+        self.assertTrue(fake_session.closed)
 
 
 class ParseSSEPayloadTests(unittest.TestCase):
