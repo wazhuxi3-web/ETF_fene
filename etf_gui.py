@@ -297,7 +297,10 @@ class ETFApp:
 
         configured_workers = normalize_worker_count(self.workers_var.get())
         workers = min(configured_workers, 4)
-        self.log(f"开始批量采集上交所当前 PCF：{len(funds)} 只基金，线程 {workers}。")
+        self.log(
+            f"开始批量采集上交所当前 PCF：{len(funds)} 只基金，线程 {workers}，"
+            "请求间隔 0.35 秒。"
+        )
         completed = 0
         written_info = 0
         written_items = 0

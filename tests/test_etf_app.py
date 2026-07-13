@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 from openpyxl import Workbook
 
 from etf_database import ETFDatabase
@@ -217,6 +218,22 @@ ENDENDEND\r
         self.assertEqual(info["内容日期"], "2026-07-13")
         self.assertEqual(len(items), 1)
         self.assertEqual(len(calls), 4)
+
+    def test_applies_global_request_interval_to_each_sse_request(self):
+        info_payload = 'cb({"result":[{"FUND_NAME":"治理ETF","TRADING_DAY":"20260713","ETF_TYPE":"5"}]})'
+        xml = "<SSEPortfolioCompositionFile><FundInstrumentID>510010</FundInstrumentID><TradingDay>20260713</TradingDay><ComponentList><Component><InstrumentID>600009</InstrumentID><Quantity>300</Quantity></Component></ComponentList></SSEPortfolioCompositionFile>"
+
+        def opener(request, timeout):
+            return type("Response", (), {
+                "read": lambda self: (info_payload if "commonQuery.do" in request.full_url else xml).encode("utf-8"),
+                "__enter__": lambda self: self,
+                "__exit__": lambda self, *args: None,
+            })()
+
+        with patch("sse_pcf_fetcher._wait_for_sse_request_slot") as wait:
+            fetch_sse_pcf_for_fund("510010", opener=opener, request_interval=0.35)
+        self.assertEqual(wait.call_count, 2)
+        wait.assert_called_with(0.35)
 
     def test_fetches_api_metadata_then_official_xml_download(self):
         calls = []

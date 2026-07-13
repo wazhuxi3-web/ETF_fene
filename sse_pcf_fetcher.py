@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import json
+import threading
 import time
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
@@ -50,6 +51,8 @@ ITEM_COLUMNS = (
 )
 
 _NULL_VALUES = {"", "-", "--", "—", "－", "None", "null", "N/A"}
+_REQUEST_SLOT_LOCK = threading.Lock()
+_NEXT_REQUEST_AT = 0.0
 
 
 def _clean_text(value) -> str | None:
@@ -456,7 +459,21 @@ def _parse_jsonp(text: str) -> dict:
     return json.loads(payload[start : end + 1])
 
 
-def _read_sse(request: Request, opener, timeout: float) -> bytes:
+def _wait_for_sse_request_slot(interval: float) -> None:
+    global _NEXT_REQUEST_AT
+    interval = max(0.0, float(interval))
+    if interval == 0:
+        return
+    with _REQUEST_SLOT_LOCK:
+        now = time.monotonic()
+        wait = max(0.0, _NEXT_REQUEST_AT - now)
+        _NEXT_REQUEST_AT = max(now, _NEXT_REQUEST_AT) + interval
+    if wait:
+        time.sleep(wait)
+
+
+def _read_sse(request: Request, opener, timeout: float, request_interval: float) -> bytes:
+    _wait_for_sse_request_slot(request_interval)
     with opener(request, timeout=timeout) as response:
         return response.read()
 
@@ -468,6 +485,7 @@ def fetch_sse_pcf_for_fund(
     timeout: float = 30,
     retry_attempts: int = 3,
     retry_delay: float = 0.8,
+    request_interval: float = 0.35,
 ) -> tuple[dict, list[dict]]:
     """Fetch one current SSE PCF; the public endpoint has no historical date argument."""
     opener = opener or urlopen
@@ -489,7 +507,7 @@ def fetch_sse_pcf_for_fund(
         try:
             info_request = Request(info_url, headers=headers)
             info_payload = _parse_jsonp(
-                _read_sse(info_request, opener, timeout).decode("utf-8-sig")
+                _read_sse(info_request, opener, timeout, request_interval).decode("utf-8-sig")
             )
             results = info_payload.get("result") or []
             if not results:
@@ -498,7 +516,7 @@ def fetch_sse_pcf_for_fund(
 
             download_url = build_sse_pcf_download_url(code, api_info.get("ETF_TYPE"))
             download_request = Request(download_url, headers=headers)
-            raw_download = _read_sse(download_request, opener, timeout)
+            raw_download = _read_sse(download_request, opener, timeout, request_interval)
             return parse_sse_pcf_download(raw_download, code, api_info=api_info)
         except (OSError, ValueError, ET.ParseError) as exc:
             last_error = exc
