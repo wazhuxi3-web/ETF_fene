@@ -1162,6 +1162,92 @@ class PCFDatabaseTests(unittest.TestCase):
 
             self.assertFalse(db.pcf_is_complete("SSE", "510010", "2026-07-13"))
 
+    def test_lists_stock_trading_dates_and_latest_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = ETFDatabase(Path(tmp) / "stock_data.db")
+            db.initialize()
+
+            self.assertEqual(db.list_stock_trading_dates("2026-07-10", "2026-07-14"), [])
+            self.assertIsNone(db.latest_stock_trading_date("2026-07-14"))
+
+            with closing(db.connect()) as conn:
+                conn.execute('CREATE TABLE stock_daily ("日期" INTEGER)')
+                conn.executemany(
+                    'INSERT INTO stock_daily ("日期") VALUES (?)',
+                    [(20260710,), (20260710,), (20260713,)],
+                )
+                conn.commit()
+
+            self.assertEqual(
+                db.list_stock_trading_dates("2026-07-10", "2026-07-14"),
+                ["2026-07-10", "2026-07-13"],
+            )
+            self.assertEqual(db.latest_stock_trading_date("2026-07-14"), "2026-07-13")
+
+    def test_replaces_one_pcf_snapshot_without_affecting_other_dates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = ETFDatabase(Path(tmp) / "stock_data.db")
+            db.initialize()
+            old_info = {**self._info("2026-07-13"), "交易所": "SZSE", "基金代码": "159915"}
+            old_item = {
+                **self._item("300002", "2026-07-13"),
+                "交易所": "SZSE",
+                "基金代码": "159915",
+                "挂牌市场": "SZSE",
+            }
+            info = {**self._info("2026-07-14"), "交易所": "SZSE", "基金代码": "159915"}
+            items = [
+                {
+                    **self._item("300001", "2026-07-14"),
+                    "交易所": "SZSE",
+                    "基金代码": "159915",
+                    "挂牌市场": "SZSE",
+                },
+                {
+                    **self._item("300002", "2026-07-14"),
+                    "交易所": "SZSE",
+                    "基金代码": "159915",
+                    "挂牌市场": "SZSE",
+                },
+            ]
+
+            db.replace_pcf_snapshot(old_info, [old_item])
+            db.replace_pcf_snapshot(info, items)
+            db.replace_pcf_snapshot(info, [items[0]], source="szse_pcf_browser")
+
+            with closing(db.connect()) as conn:
+                current_codes = [
+                    row["证券代码"]
+                    for row in conn.execute(
+                        'SELECT "证券代码" FROM ETF_ITEM '
+                        'WHERE "交易所" = ? AND "基金代码" = ? AND "内容日期" = ? '
+                        'ORDER BY "证券代码"',
+                        ("SZSE", "159915", "2026-07-14"),
+                    )
+                ]
+                old_codes = [
+                    row["证券代码"]
+                    for row in conn.execute(
+                        'SELECT "证券代码" FROM ETF_ITEM '
+                        'WHERE "交易所" = ? AND "基金代码" = ? AND "内容日期" = ? ',
+                        ("SZSE", "159915", "2026-07-13"),
+                    )
+                ]
+                info_source = conn.execute(
+                    'SELECT source FROM ETF_INFO WHERE "交易所" = ? AND "基金代码" = ? AND "内容日期" = ?',
+                    ("SZSE", "159915", "2026-07-14"),
+                ).fetchone()["source"]
+                item_source = conn.execute(
+                    'SELECT source FROM ETF_ITEM WHERE "交易所" = ? AND "基金代码" = ? AND "内容日期" = ?',
+                    ("SZSE", "159915", "2026-07-14"),
+                ).fetchone()["source"]
+
+            self.assertTrue(db.pcf_is_complete("SZSE", "159915", "2026-07-14"))
+            self.assertEqual(current_codes, ["300001"])
+            self.assertEqual(old_codes, ["300002"])
+            self.assertEqual(info_source, "szse_pcf_browser")
+            self.assertEqual(item_source, "szse_pcf_browser")
+
     def test_lists_distinct_fund_codes_for_pcf_batch(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = ETFDatabase(Path(tmp) / "stock_data.db")

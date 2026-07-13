@@ -193,7 +193,114 @@ class ETFDatabase:
             ).fetchone()[0]
         return info_exists is not None and item_count > 0
 
-    def upsert_pcf(self, info_rows: list[dict], item_rows: list[dict]) -> tuple[int, int]:
+    @staticmethod
+    def _format_stock_trading_date(value: object) -> str:
+        digits = str(value).split(".", 1)[0].zfill(8)
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+
+    def list_stock_trading_dates(self, start_date: str, end_date: str) -> list[str]:
+        start_value = int(start_date.replace("-", ""))
+        end_value = int(end_date.replace("-", ""))
+        with closing(self.connect()) as conn:
+            table_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'stock_daily'"
+            ).fetchone()
+            if table_exists is None:
+                return []
+            rows = conn.execute(
+                'SELECT DISTINCT "日期" AS trade_date FROM stock_daily '
+                'WHERE "日期" BETWEEN ? AND ? ORDER BY "日期"',
+                (start_value, end_value),
+            ).fetchall()
+        return [self._format_stock_trading_date(row["trade_date"]) for row in rows]
+
+    def latest_stock_trading_date(self, on_or_before: str) -> str | None:
+        end_value = int(on_or_before.replace("-", ""))
+        with closing(self.connect()) as conn:
+            table_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'stock_daily'"
+            ).fetchone()
+            if table_exists is None:
+                return None
+            row = conn.execute(
+                'SELECT MAX("日期") AS trade_date FROM stock_daily WHERE "日期" <= ?',
+                (end_value,),
+            ).fetchone()
+        if row["trade_date"] is None:
+            return None
+        return self._format_stock_trading_date(row["trade_date"])
+
+    def replace_pcf_snapshot(
+        self,
+        info: dict,
+        items: list[dict],
+        source: str = "sse_pcf",
+    ) -> tuple[int, int]:
+        key_fields = ("交易所", "基金代码", "内容日期")
+        if not isinstance(info, dict):
+            raise ValueError("info must be a dict")
+        if not items or not all(isinstance(item, dict) for item in items):
+            raise ValueError("items must contain at least one row")
+
+        info_key = tuple(info.get(field) for field in key_fields)
+        item_keys = {tuple(item.get(field) for field in key_fields) for item in items}
+        if any(not all(value is not None and value != "" for value in key) for key in (info_key, *item_keys)):
+            raise ValueError("PCF snapshot keys must be present")
+        if item_keys != {info_key}:
+            raise ValueError("PCF snapshot keys must match")
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        info_fields = PCF_INFO_COLUMNS
+        item_fields = PCF_ITEM_COLUMNS
+        info_sql_fields = ", ".join(f'"{field}"' for field in info_fields)
+        item_sql_fields = ", ".join(f'"{field}"' for field in item_fields)
+        info_updates = ", ".join(
+            f'"{field}" = excluded."{field}"'
+            for field in info_fields
+            if field not in key_fields
+        )
+        item_updates = ", ".join(
+            f'"{field}" = excluded."{field}"'
+            for field in item_fields
+            if field not in (*key_fields, "证券代码", "挂牌市场")
+        )
+        info_values = tuple(info.get(field) for field in info_fields)
+        item_values = [tuple(item.get(field) for field in item_fields) for item in items]
+
+        with closing(self.connect()) as conn:
+            with conn:
+                conn.execute(
+                    'DELETE FROM ETF_ITEM WHERE "交易所" = ? AND "基金代码" = ? AND "内容日期" = ?',
+                    info_key,
+                )
+                placeholders = ", ".join("?" for _ in info_fields)
+                conn.execute(
+                    f"""
+                    INSERT INTO ETF_INFO ({info_sql_fields}, source, updated_at)
+                    VALUES ({placeholders}, ?, ?)
+                    ON CONFLICT("交易所", "基金代码", "内容日期") DO UPDATE SET
+                        {info_updates}, source = excluded.source, updated_at = excluded.updated_at
+                    """,
+                    info_values + (source, now),
+                )
+                placeholders = ", ".join("?" for _ in item_fields)
+                conn.executemany(
+                    f"""
+                    INSERT INTO ETF_ITEM ({item_sql_fields}, source, updated_at)
+                    VALUES ({placeholders}, ?, ?)
+                    ON CONFLICT("交易所", "基金代码", "内容日期", "证券代码", "挂牌市场") DO UPDATE SET
+                        {item_updates}, source = excluded.source, updated_at = excluded.updated_at
+                    """,
+                    [values + (source, now) for values in item_values],
+                )
+        return 1, len(item_values)
+
+    def upsert_pcf(
+        self,
+        info_rows: list[dict],
+        item_rows: list[dict],
+        source: str = "sse_pcf",
+    ) -> tuple[int, int]:
         if not info_rows and not item_rows:
             return 0, 0
 
@@ -229,22 +336,22 @@ class ETFDatabase:
                 conn.executemany(
                     f"""
                     INSERT INTO ETF_INFO ({info_sql_fields}, source, updated_at)
-                    VALUES ({placeholders}, 'sse_pcf', ?)
+                    VALUES ({placeholders}, ?, ?)
                     ON CONFLICT("交易所", "基金代码", "内容日期") DO UPDATE SET
-                        {info_updates}, source = 'sse_pcf', updated_at = excluded.updated_at
+                        {info_updates}, source = excluded.source, updated_at = excluded.updated_at
                     """,
-                    [values + (now,) for values in info_values],
+                    [values + (source, now) for values in info_values],
                 )
             if item_values:
                 placeholders = ", ".join("?" for _ in item_fields)
                 conn.executemany(
                     f"""
                     INSERT INTO ETF_ITEM ({item_sql_fields}, source, updated_at)
-                    VALUES ({placeholders}, 'sse_pcf', ?)
+                    VALUES ({placeholders}, ?, ?)
                     ON CONFLICT("交易所", "基金代码", "内容日期", "证券代码", "挂牌市场") DO UPDATE SET
-                        {item_updates}, source = 'sse_pcf', updated_at = excluded.updated_at
+                        {item_updates}, source = excluded.source, updated_at = excluded.updated_at
                     """,
-                    [values + (now,) for values in item_values],
+                    [values + (source, now) for values in item_values],
                 )
             conn.commit()
         return len(info_values), len(item_values)
