@@ -29,7 +29,174 @@ from szse_download_fetcher import (
     split_szse_download_ranges,
     validate_szse_download_batch_range,
 )
+from sse_pcf_fetcher import (
+    normalize_pcf_info,
+    normalize_pcf_item,
+    parse_sse_pcf_html,
+    parse_sse_pcf_xml,
+    build_sse_pcf_download_url,
+    fetch_sse_pcf_for_fund,
+)
 from etf_web_app import ETFWebServer, HTML, parse_web_endpoint
+
+
+class PCFNormalizationTests(unittest.TestCase):
+    def test_normalizes_info_with_chinese_columns_and_null_missing_values(self):
+        info = normalize_pcf_info(
+            {
+                "最新公告日期": "2026-07-13",
+                "内容日期": "2026-07-13",
+                "基金代码": "510010",
+                "基金名称": "治理ETF",
+                "现金差额": "21,388.57",
+                "现金替代比例上限": "30%",
+            }
+        )
+
+        self.assertEqual(info["基金代码"], "510010")
+        self.assertEqual(info["现金差额"], 21388.57)
+        self.assertEqual(info["现金替代比例上限"], 30.0)
+        self.assertIsNone(info["申购赎回模式"])
+        self.assertEqual(info["交易所"], "SSE")
+
+    def test_normalizes_item_fields(self):
+        item = normalize_pcf_item(
+            {
+                "证券代码": "600009",
+                "证券简称": "上海机场",
+                "股票数量": "300",
+                "现金替代标志": "允许",
+                "申购现金替代溢价比例": "34%",
+                "替代金额": "-",
+                "挂牌市场": "上海证券交易所",
+            }
+        )
+
+        self.assertEqual(item["股票数量"], 300.0)
+        self.assertEqual(item["申购现金替代溢价比例"], 34.0)
+        self.assertIsNone(item["替代金额"])
+
+
+class PCFParserTests(unittest.TestCase):
+    def test_parses_announcement_content_and_component_rows(self):
+        html = """
+        <h2>申购赎回清单</h2>
+        <table><tr><td>最新公告日期</td><td>2026-07-13</td></tr>
+        <tr><td>基金名称</td><td>上证180公司治理ETF</td></tr>
+        <tr><td>基金管理公司名称</td><td>交银施罗德基金管理有限公司</td></tr>
+        <tr><td>基金代码</td><td>510010</td></tr></table>
+        <h2>2026-07-10日内容信息</h2>
+        <table><tr><td>现金差额(单位：元)</td><td>21388.57</td></tr>
+        <tr><td>基金份额净值(单位：元)</td><td>1.6840</td></tr></table>
+        <h2>2026-07-13日内容信息</h2>
+        <table><tr><td>现金替代比例上限</td><td>30%</td></tr>
+        <tr><td>最小申购、赎回单位(单位:份)</td><td>1000000</td></tr>
+        <tr><td>申购赎回模式</td><td>沪市成分证券实物对价</td></tr></table>
+        <h2>成份股信息内容</h2>
+        <table><thead><tr><th>证券代码</th><th>证券简称</th>
+        <th>股票数量(股)</th><th>现金替代标志</th>
+        <th>申购现金替代溢价比例</th><th>赎回现金替代折价比例</th>
+        <th>替代金额(单位：人民币元)</th><th>挂牌市场</th></tr></thead>
+        <tbody><tr><td>600009</td><td>上海机场</td><td>300</td><td>允许</td>
+        <td>34%</td><td>0%</td><td>-</td><td>上海证券交易所</td></tr></tbody></table>
+        """
+
+        info, items = parse_sse_pcf_html(html, "510010")
+
+        self.assertEqual(info["基金代码"], "510010")
+        self.assertEqual(info["内容日期"], "2026-07-13")
+        self.assertEqual(info["现金差额"], 21388.57)
+        self.assertEqual(info["现金替代比例上限"], 30.0)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["证券代码"], "600009")
+        self.assertEqual(items[0]["股票数量"], 300.0)
+        self.assertNotIn("(单位：元)", "".join(info.keys()))
+
+    def test_parses_official_xml_and_maps_current_content_date(self):
+        xml = """
+        <SSEPortfolioCompositionFile>
+          <FundInstrumentID>510010</FundInstrumentID>
+          <CreationRedemptionUnit>1000000</CreationRedemptionUnit>
+          <TradingDay>20260713</TradingDay>
+          <PreTradingDay>20260710</PreTradingDay>
+          <NAVperCU>1683754.39</NAVperCU>
+          <NAV>1.684</NAV>
+          <PreCashComponent>21388.57</PreCashComponent>
+          <EstimatedCashComponent>21247.09</EstimatedCashComponent>
+          <MaxCashRatio>0.3</MaxCashRatio>
+          <PublishIOPVFlag>1</PublishIOPVFlag>
+          <CreationRedemptionMechanism>1</CreationRedemptionMechanism>
+          <ComponentList>
+            <Component>
+              <InstrumentID>600009</InstrumentID>
+              <InstrumentName>上海机场</InstrumentName>
+              <Quantity>300</Quantity>
+              <SubstitutionFlag>1</SubstitutionFlag>
+              <CreationPremiumRate>0.34</CreationPremiumRate>
+              <RedemptionDiscountRate>0</RedemptionDiscountRate>
+              <UnderlyingSecurityID>101</UnderlyingSecurityID>
+            </Component>
+          </ComponentList>
+        </SSEPortfolioCompositionFile>
+        """
+        info, items = parse_sse_pcf_xml(
+            xml,
+            "510010",
+            api_info={
+                "FUND_NAME": "治理ETF",
+                "FUND_COMP_NAME": "交银施罗德基金管理有限公司",
+                "TRADING_DAY": "20260713",
+            },
+        )
+        self.assertEqual(info["基金代码"], "510010")
+        self.assertEqual(info["内容日期"], "2026-07-13")
+        self.assertEqual(info["基金名称"], "治理ETF")
+        self.assertEqual(info["现金差额"], 21388.57)
+        self.assertEqual(info["现金替代比例上限"], 30.0)
+        self.assertEqual(info["是否需要公布IOPV"], "是")
+        self.assertEqual(items[0]["证券代码"], "600009")
+        self.assertEqual(items[0]["股票数量"], 300.0)
+        self.assertEqual(items[0]["申购现金替代溢价比例"], 34.0)
+        self.assertEqual(items[0]["挂牌市场"], "上交所")
+
+    def test_download_url_contains_only_supported_current_parameters(self):
+        url = build_sse_pcf_download_url("510010", "5")
+        self.assertIn("fundCode=510010", url)
+        self.assertIn("etfType=5", url)
+        self.assertNotIn("startDate", url)
+
+    def test_fetches_api_metadata_then_official_xml_download(self):
+        calls = []
+        info_payload = (
+            'cb({"result":[{"FUND_NAME":"治理ETF",'
+            '"FUND_COMP_NAME":"交银施罗德基金管理有限公司",'
+            '"TRADING_DAY":"20260713","ETF_TYPE":"5",'
+            '"CREATION_REDEMPTION":"申购和赎回皆允许"}]})'
+        )
+        xml = """
+        <SSEPortfolioCompositionFile>
+          <FundInstrumentID>510010</FundInstrumentID>
+          <TradingDay>20260713</TradingDay>
+          <ComponentList><Component><InstrumentID>600009</InstrumentID>
+          <InstrumentName>上海机场</InstrumentName><Quantity>300</Quantity>
+          <UnderlyingSecurityID>101</UnderlyingSecurityID></Component></ComponentList>
+        </SSEPortfolioCompositionFile>
+        """
+
+        def opener(request, timeout):
+            calls.append(request.full_url)
+            return type("Response", (), {
+                "read": lambda self: (info_payload if "commonQuery.do" in request.full_url else xml).encode("utf-8"),
+                "__enter__": lambda self: self,
+                "__exit__": lambda self, *args: None,
+            })()
+
+        info, items = fetch_sse_pcf_for_fund("510010", opener=opener)
+        self.assertEqual(info["内容日期"], "2026-07-13")
+        self.assertEqual(len(items), 1)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("FUNDID2=510010", calls[0])
+        self.assertIn("fundCode=510010", calls[1])
 
 
 class ParseSSEPayloadTests(unittest.TestCase):
@@ -705,6 +872,110 @@ class ETFDatabaseTests(unittest.TestCase):
             self.assertEqual(history[0]["low_price"], 4.01)
             self.assertEqual(history[0]["close_price"], 4.56)
             self.assertEqual(history[0]["volume"], 123456.0)
+
+
+class PCFDatabaseTests(unittest.TestCase):
+    def _info(self, date="2026-07-13"):
+        return {
+            "交易所": "SSE",
+            "基金代码": "510010",
+            "基金名称": "治理ETF",
+            "基金管理公司名称": "交银施罗德基金管理有限公司",
+            "最新公告日期": date,
+            "内容日期": date,
+            "现金差额": 100.0,
+            "基金份额净值": 1.68,
+            "现金替代比例上限": 30.0,
+            "最小申购、赎回单位": 1000000.0,
+            "申购赎回模式": "沪市成分证券实物对价",
+        }
+
+    def _item(self, code="600009", date="2026-07-13"):
+        return {
+            "交易所": "SSE",
+            "基金代码": "510010",
+            "内容日期": date,
+            "证券代码": code,
+            "证券简称": "上海机场",
+            "股票数量": 300.0,
+            "现金替代标志": "允许",
+            "申购现金替代溢价比例": 34.0,
+            "赎回现金替代折价比例": 0.0,
+            "替代金额": None,
+            "挂牌市场": "上海证券交易所",
+        }
+
+    def test_creates_pcf_tables_with_chinese_headers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = ETFDatabase(Path(tmp) / "stock_data.db")
+            db.initialize()
+
+            with closing(db.connect()) as conn:
+                info_columns = {
+                    row["name"] for row in conn.execute("PRAGMA table_info(ETF_INFO)")
+                }
+                item_columns = {
+                    row["name"] for row in conn.execute("PRAGMA table_info(ETF_ITEM)")
+                }
+
+            self.assertIn("基金代码", info_columns)
+            self.assertIn("内容日期", info_columns)
+            self.assertIn("证券代码", item_columns)
+            self.assertIn("挂牌市场", item_columns)
+
+    def test_upsert_is_idempotent_and_complete_check_is_per_fund_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = ETFDatabase(Path(tmp) / "stock_data.db")
+            db.initialize()
+            info = self._info()
+            item = self._item()
+
+            self.assertEqual(db.upsert_pcf([info], [item]), (1, 1))
+            self.assertTrue(db.pcf_is_complete("SSE", "510010", "2026-07-13"))
+            self.assertEqual(
+                db.existing_pcf_keys("SSE", "2026-07-01", "2026-07-31"),
+                {("510010", "2026-07-13")},
+            )
+
+            db.upsert_pcf([info], [item])
+            with closing(db.connect()) as conn:
+                info_count = conn.execute("SELECT COUNT(*) FROM ETF_INFO").fetchone()[0]
+                item_count = conn.execute("SELECT COUNT(*) FROM ETF_ITEM").fetchone()[0]
+            self.assertEqual(info_count, 1)
+            self.assertEqual(item_count, 1)
+
+    def test_incomplete_pcf_is_not_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = ETFDatabase(Path(tmp) / "stock_data.db")
+            db.initialize()
+            db.upsert_pcf([self._info()], [])
+
+            self.assertFalse(db.pcf_is_complete("SSE", "510010", "2026-07-13"))
+
+    def test_lists_distinct_fund_codes_for_pcf_batch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = ETFDatabase(Path(tmp) / "stock_data.db")
+            db.initialize()
+            db.upsert_rows(
+                [
+                    {"trade_date": "2026-07-13", "exchange": "SSE", "fund_code": "510010", "fund_name": "治理ETF", "total_share": 1},
+                    {"trade_date": "2026-07-12", "exchange": "SSE", "fund_code": "510010", "fund_name": "治理ETF", "total_share": 1},
+                    {"trade_date": "2026-07-13", "exchange": "SZSE", "fund_code": "159001", "fund_name": "易方达", "total_share": 1},
+                ],
+                recalculate=False,
+            )
+            self.assertEqual(db.list_fund_codes("SSE"), [{"fund_code": "510010", "fund_name": "治理ETF"}])
+
+
+class PCFGuiTests(unittest.TestCase):
+    def test_gui_has_pcf_actions_and_independent_log_scrollbar(self):
+        source = Path("etf_gui.py").read_text(encoding="utf-8-sig")
+        self.assertIn("fetch_sse_pcf_for_fund", source)
+        self.assertIn("采集当前 PCF", source)
+        self.assertIn("批量采集上交所当前 PCF", source)
+        self.assertIn("log_frame", source)
+        self.assertIn("log_scrollbar", source)
+        self.assertIn("yscrollcommand=log_scrollbar.set", source)
 
 
 class ETFWebServerTests(unittest.TestCase):

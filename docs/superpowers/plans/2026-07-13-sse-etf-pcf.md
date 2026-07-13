@@ -4,7 +4,9 @@
 
 **Goal:** 在现有 ETF 工具中增加上交所 PCF 采集，写入 `ETF_INFO`、`ETF_ITEM`，并把 GUI 日志改成可读、独立滚动布局。
 
-**Architecture:** 新增 `sse_pcf_fetcher.py`，负责上交所详情页/历史公告解析和标准化；`etf_database.py` 新增两张表及幂等写入接口；`etf_gui.py` 增加 PCF 采集入口并把控制区、统计区、日志区分开。复用现有 ETF 份额表作为上交所 ETF 代码来源，避免另造基金列表。
+> **Execution note:** 上交所当前公开 PCF 接口只接受基金代码，返回当前公告日；历史日期参数会被忽略。本次实现因此采集当前公告日 PCF，并明确保留历史数据能力待后续接入公告档案，不伪造历史数据。
+
+**Architecture:** 新增 `sse_pcf_fetcher.py`，负责上交所 JSONP 元数据、官方 XML 下载和标准化；`etf_database.py` 新增两张表及幂等写入接口；`etf_gui.py` 增加单只/批量当前 PCF 采集入口并把控制区、统计区、日志区分开。复用现有 ETF 份额表作为上交所 ETF 代码来源，避免另造基金列表。
 
 **Tech Stack:** Python 标准库、`urllib`、`html.parser`、`sqlite3`、Tkinter、`unittest`。
 
@@ -145,29 +147,30 @@ Run: `python -B -m unittest tests.test_etf_app.PCFDatabaseTests -v`
 
 Expected: PASS.
 
-### Task 4: Add SSE PCF fetch adapter and date-range behavior
+### Task 4: Add SSE PCF fetch adapter
 
 **Files:**
 - Modify: `tests/test_etf_app.py`
 - Modify: `sse_pcf_fetcher.py`
 
 **Interfaces:**
-- `fetch_sse_pcf_for_fund(fund_code, content_date=None, opener=None) -> tuple[dict, list[dict]]`
-- `iter_sse_pcf_dates(start_date, end_date) -> iterator[str]`
+- `fetch_sse_pcf_for_fund(fund_code, opener=None, timeout=30) -> tuple[dict, list[dict]]`
+- `parse_sse_pcf_xml(xml, fund_code, api_info=None) -> tuple[dict, list[dict]]`
+- `build_sse_pcf_download_url(fund_code, etf_type=None) -> str`
 
 - [ ] **Step 1: Write failing adapter tests**
 
-Test that the request uses `fundid=<code>`, that a requested historical content date is passed through the official history route, that the parser result is returned, and that a range from `2026-01-01` to `2026-07-13` remains one date iterator with no five-month split.
+Test that metadata JSONP is requested before the official XML download, the fund code and ETF type are passed correctly, the parser result is returned, and the download URL contains no unsupported historical date parameter.
 
 - [ ] **Step 2: Run RED tests**
 
 Run: `python -B -m unittest tests.test_etf_app.PCFFetcherTests -v`
 
-Expected: FAIL because the fetch adapter and date iterator are absent.
+Expected: FAIL because the fetch adapter is absent.
 
 - [ ] **Step 3: Implement fetch adapter**
 
-Use the official SSE detail URL for current data and the confirmed official historical route for historical content. Keep HTTP headers consistent with the existing SSE fetcher. Raise `ETFNetworkError` on transport errors, non-HTML responses, missing key fields, or a page that returns a different content date than requested.
+Use the public SSE JSONP metadata endpoint followed by `downloadETF2Bulletin.do` XML. Keep HTTP headers consistent with the existing SSE fetcher. Preserve the returned content date and do not retry with fabricated historical parameters.
 
 - [ ] **Step 4: Run GREEN adapter tests**
 
@@ -182,12 +185,13 @@ Expected: PASS.
 - Modify: `etf_gui.py`
 
 **Interfaces:**
-- `ETFApp.fetch_pcf_range()` starts a background PCF collection using existing date inputs.
-- `ETFApp._append_log(text, level="INFO", phase="日志")` appends one formatted line without moving controls.
+- `ETFApp.fetch_pcf_single()` starts a background current-PCF collection for the entered code.
+- `ETFApp.fetch_pcf_batch()` starts a background batch for all SSE codes already in `ETF`.
+- `ETFApp._append_log(text)` appends one formatted line without moving controls.
 
 - [ ] **Step 1: Write failing GUI/source tests**
 
-Assert the GUI has a PCF collection button, imports `fetch_sse_pcf_for_fund`, does not call a five-month splitter for SSE PCF, creates a separate log frame with a scrollbar, and binds the log text widget rather than the whole root frame to scrolling.
+Assert the GUI has PCF collection buttons, imports `fetch_sse_pcf_for_fund`, creates a separate log frame with a scrollbar, and binds the log text widget rather than the whole root frame to scrolling.
 
 - [ ] **Step 2: Run RED tests**
 
@@ -201,7 +205,7 @@ Build the root with a fixed top control frame and a bottom expandable log frame.
 
 - [ ] **Step 4: Implement PCF worker**
 
-Use known SSE fund codes from `ETF` for each requested date. Check `pcf_is_complete` per fund/date before network access. Parse and transactionally upsert complete results. Track the current date and fund index in `paused_task`; a connection failure logs one concise failure and pauses. Completion logs aggregate info/item counts.
+Use known SSE fund codes from `ETF`. Fetch each fund's current XML, parse and transactionally upsert the complete result. Batch requests use at most four workers and a single failed fund is logged and skipped; completion logs aggregate info/item counts.
 
 - [ ] **Step 5: Run GREEN GUI tests**
 

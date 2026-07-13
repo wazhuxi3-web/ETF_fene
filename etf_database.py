@@ -9,6 +9,22 @@ from pathlib import Path
 DEFAULT_DB_PATH = Path(r"E:\学习\交易\stock_data\stock_data.db")
 
 
+PCF_INFO_COLUMNS = (
+    "交易所", "基金代码", "基金名称", "基金管理公司名称", "最新公告日期", "内容日期",
+    "现金差额", "最小申购、赎回单位净值", "基金份额净值", "最小申购、赎回单位的预估现金部分",
+    "现金替代比例上限", "当日累计可申购的基金份额上限", "当日累计可赎回的基金份额上限",
+    "当日净申购的基金份额上限", "当日净赎回的基金份额上限",
+    "单个证券账户当日净申购的基金份额上限", "单个证券账户当日净赎回的基金份额上限",
+    "单个证券账户当日累计可申购的基金份额上限", "单个证券账户当日累计可赎回的基金份额上限",
+    "是否需要公布IOPV", "最小申购、赎回单位", "申购赎回的允许情况", "申购赎回模式",
+)
+
+PCF_ITEM_COLUMNS = (
+    "交易所", "基金代码", "内容日期", "证券代码", "证券简称", "股票数量", "现金替代标志",
+    "申购现金替代溢价比例", "赎回现金替代折价比例", "替代金额", "挂牌市场",
+)
+
+
 class ETFDatabase:
     def __init__(self, db_path: str | Path = DEFAULT_DB_PATH):
         self.db_path = Path(db_path)
@@ -77,6 +93,51 @@ class ETFDatabase:
         )
         conn.execute("DROP TABLE ETF_legacy")
 
+    @staticmethod
+    def _create_pcf_tables(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ETF_INFO (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                "交易所" TEXT NOT NULL DEFAULT 'SSE', "基金代码" TEXT NOT NULL,
+                "基金名称" TEXT, "基金管理公司名称" TEXT, "最新公告日期" TEXT,
+                "内容日期" TEXT NOT NULL, "现金差额" REAL,
+                "最小申购、赎回单位净值" REAL, "基金份额净值" REAL,
+                "最小申购、赎回单位的预估现金部分" REAL, "现金替代比例上限" REAL,
+                "当日累计可申购的基金份额上限" REAL, "当日累计可赎回的基金份额上限" REAL,
+                "当日净申购的基金份额上限" REAL, "当日净赎回的基金份额上限" REAL,
+                "单个证券账户当日净申购的基金份额上限" REAL,
+                "单个证券账户当日净赎回的基金份额上限" REAL,
+                "单个证券账户当日累计可申购的基金份额上限" REAL,
+                "单个证券账户当日累计可赎回的基金份额上限" REAL,
+                "是否需要公布IOPV" TEXT, "最小申购、赎回单位" REAL,
+                "申购赎回的允许情况" TEXT, "申购赎回模式" TEXT,
+                source TEXT NOT NULL DEFAULT 'sse_pcf', updated_at TEXT NOT NULL,
+                UNIQUE("交易所", "基金代码", "内容日期")
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ETF_ITEM (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                "交易所" TEXT NOT NULL DEFAULT 'SSE', "基金代码" TEXT NOT NULL,
+                "内容日期" TEXT NOT NULL, "证券代码" TEXT NOT NULL, "证券简称" TEXT,
+                "股票数量" REAL, "现金替代标志" TEXT,
+                "申购现金替代溢价比例" REAL, "赎回现金替代折价比例" REAL,
+                "替代金额" REAL, "挂牌市场" TEXT,
+                source TEXT NOT NULL DEFAULT 'sse_pcf', updated_at TEXT NOT NULL,
+                UNIQUE("交易所", "基金代码", "内容日期", "证券代码", "挂牌市场")
+            )
+            """
+        )
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_etf_info_date ON ETF_INFO("交易所", "内容日期")'
+        )
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_etf_item_date ON ETF_ITEM("交易所", "内容日期")'
+        )
+
     def initialize(self) -> None:
         with closing(self.connect()) as conn:
             exists = conn.execute(
@@ -86,6 +147,7 @@ class ETFDatabase:
                 self._migrate_etf_schema(conn)
             else:
                 self._create_etf_table(conn)
+            self._create_pcf_tables(conn)
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_etf_code_date ON ETF(fund_code, trade_date)"
             )
@@ -97,6 +159,95 @@ class ETFDatabase:
                 "ON ETF(exchange, fund_code, trade_date)"
             )
             conn.commit()
+
+    def existing_pcf_keys(
+        self, exchange: str, start_date: str, end_date: str
+    ) -> set[tuple[str, str]]:
+        with closing(self.connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT "基金代码" AS fund_code, "内容日期" AS content_date
+                FROM ETF_INFO
+                WHERE "交易所" = ? AND "内容日期" BETWEEN ? AND ?
+                """,
+                (str(exchange).strip().upper(), start_date, end_date),
+            ).fetchall()
+        return {(str(row["fund_code"]), str(row["content_date"])) for row in rows}
+
+    def pcf_is_complete(self, exchange: str, fund_code: str, content_date: str) -> bool:
+        key = (str(exchange).strip().upper(), str(fund_code).strip(), content_date)
+        with closing(self.connect()) as conn:
+            info_exists = conn.execute(
+                """
+                SELECT 1 FROM ETF_INFO
+                WHERE "交易所" = ? AND "基金代码" = ? AND "内容日期" = ?
+                """,
+                key,
+            ).fetchone()
+            item_count = conn.execute(
+                """
+                SELECT COUNT(*) FROM ETF_ITEM
+                WHERE "交易所" = ? AND "基金代码" = ? AND "内容日期" = ?
+                """,
+                key,
+            ).fetchone()[0]
+        return info_exists is not None and item_count > 0
+
+    def upsert_pcf(self, info_rows: list[dict], item_rows: list[dict]) -> tuple[int, int]:
+        if not info_rows and not item_rows:
+            return 0, 0
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        info_fields = PCF_INFO_COLUMNS
+        item_fields = PCF_ITEM_COLUMNS
+        info_sql_fields = ", ".join(f'"{field}"' for field in info_fields)
+        item_sql_fields = ", ".join(f'"{field}"' for field in item_fields)
+        info_updates = ", ".join(
+            f'"{field}" = excluded."{field}"'
+            for field in info_fields
+            if field not in {"交易所", "基金代码", "内容日期"}
+        )
+        item_updates = ", ".join(
+            f'"{field}" = excluded."{field}"'
+            for field in item_fields
+            if field not in {"交易所", "基金代码", "内容日期", "证券代码", "挂牌市场"}
+        )
+        info_values = [
+            tuple(row.get(field) for field in info_fields)
+            for row in info_rows
+            if row.get("基金代码") and row.get("内容日期")
+        ]
+        item_values = [
+            tuple(row.get(field) for field in item_fields)
+            for row in item_rows
+            if row.get("基金代码") and row.get("内容日期") and row.get("证券代码")
+        ]
+
+        with closing(self.connect()) as conn:
+            if info_values:
+                placeholders = ", ".join("?" for _ in info_fields)
+                conn.executemany(
+                    f"""
+                    INSERT INTO ETF_INFO ({info_sql_fields}, source, updated_at)
+                    VALUES ({placeholders}, 'sse_pcf', ?)
+                    ON CONFLICT("交易所", "基金代码", "内容日期") DO UPDATE SET
+                        {info_updates}, source = 'sse_pcf', updated_at = excluded.updated_at
+                    """,
+                    [values + (now,) for values in info_values],
+                )
+            if item_values:
+                placeholders = ", ".join("?" for _ in item_fields)
+                conn.executemany(
+                    f"""
+                    INSERT INTO ETF_ITEM ({item_sql_fields}, source, updated_at)
+                    VALUES ({placeholders}, 'sse_pcf', ?)
+                    ON CONFLICT("交易所", "基金代码", "内容日期", "证券代码", "挂牌市场") DO UPDATE SET
+                        {item_updates}, source = 'sse_pcf', updated_at = excluded.updated_at
+                    """,
+                    [values + (now,) for values in item_values],
+                )
+            conn.commit()
+        return len(info_values), len(item_values)
 
     def upsert_rows(self, rows: list[dict], recalculate: bool = True) -> int:
         if not rows:
@@ -164,6 +315,20 @@ class ETFDatabase:
                 (str(exchange).strip().upper(), start_date, end_date),
             ).fetchall()
         return {str(row["trade_date"]) for row in rows}
+
+    def list_fund_codes(self, exchange: str = "SSE") -> list[dict]:
+        with closing(self.connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT fund_code, MAX(fund_name) AS fund_name
+                FROM ETF
+                WHERE exchange = ?
+                GROUP BY fund_code
+                ORDER BY fund_code
+                """,
+                (str(exchange).strip().upper(),),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def _recalculate_deltas(self, conn: sqlite3.Connection, fund_codes: list[str]) -> None:
         code_placeholders = ",".join("?" for _ in fund_codes)

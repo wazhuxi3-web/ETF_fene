@@ -24,6 +24,7 @@ from szse_download_fetcher import (
     check_szse_download_connection,
     fetch_szse_rows_via_browser_downloads,
 )
+from sse_pcf_fetcher import fetch_sse_pcf_for_fund
 from etf_web_app import ETFWebServer
 from etf_web_app import parse_web_endpoint
 
@@ -115,6 +116,7 @@ class ETFApp:
         self.web_host_var = tk.StringVar(value="127.0.0.1")
         self.web_port_var = tk.StringVar(value="1234")
         self.exchange_var = tk.StringVar(value="上交所")
+        self.pcf_code_var = tk.StringVar()
         self.busy = False
         self.paused_task = None
         self._build_ui()
@@ -156,6 +158,13 @@ class ETFApp:
         ttk.Entry(form, textvariable=self.workers_var, width=6).grid(row=1, column=4, padx=4)
         ttk.Button(form, text="多线程采集区间", command=self.fetch_range).grid(row=1, column=5, padx=4)
 
+        pcf_form = ttk.LabelFrame(frame, text="上交所 ETF 成分股（当前公告日）", padding=10)
+        pcf_form.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(pcf_form, text="基金代码").grid(row=0, column=0, padx=4, pady=4)
+        ttk.Entry(pcf_form, textvariable=self.pcf_code_var, width=14).grid(row=0, column=1, padx=4)
+        ttk.Button(pcf_form, text="采集当前 PCF", command=self.fetch_pcf_single).grid(row=0, column=2, padx=4)
+        ttk.Button(pcf_form, text="批量采集上交所当前 PCF", command=self.fetch_pcf_batch).grid(row=0, column=3, padx=4)
+
         web_form = ttk.LabelFrame(frame, text="网页", padding=10)
         web_form.pack(fill=tk.X, pady=(0, 10))
         ttk.Label(web_form, text="地址").grid(row=0, column=0, padx=4, pady=4)
@@ -172,15 +181,38 @@ class ETFApp:
         self.stats_var = tk.StringVar()
         ttk.Label(toolbar, textvariable=self.stats_var).pack(side=tk.LEFT, padx=12)
 
-        self.log_text = tk.Text(frame, height=18, wrap="word")
-        self.log_text.pack(fill=tk.BOTH, expand=True)
+        log_frame = ttk.LabelFrame(frame, text="运行日志", padding=6)
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+        log_frame.rowconfigure(0, weight=1)
+        log_frame.columnconfigure(0, weight=1)
+        self.log_text = tk.Text(log_frame, height=12, wrap="word")
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        log_scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        log_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.log_text.configure(yscrollcommand=log_scrollbar.set)
 
     def log(self, text):
         self.root.after(0, lambda: self._append_log(text))
 
     def _append_log(self, text):
-        self.log_text.insert(tk.END, text + "\n")
-        self.log_text.see(tk.END)
+        follow_bottom = self.log_text.yview()[1] >= 0.999
+        phase = self._log_phase(text)
+        line = f"[{datetime.now():%H:%M:%S}] [{phase}] {text}"
+        self.log_text.insert(tk.END, line + "\n")
+        if follow_bottom:
+            self.log_text.see(tk.END)
+
+    @staticmethod
+    def _log_phase(text):
+        if any(word in text for word in ("失败", "错误", "异常")):
+            return "失败"
+        if any(word in text for word in ("写入", "更新", "计算", "入库")):
+            return "入库"
+        if any(word in text for word in ("采集", "下载", "抓取", "PCF")):
+            return "采集"
+        if "网页" in text:
+            return "网页"
+        return "状态"
 
     def _run(self, func):
         if self.busy:
@@ -237,6 +269,57 @@ class ETFApp:
                     break
 
         self._run(task)
+
+    def fetch_pcf_single(self):
+        code = self.pcf_code_var.get().strip()
+        if not code.isdigit() or len(code) != 6:
+            messagebox.showerror("基金代码错误", "请输入 6 位数字基金代码。")
+            return
+        self._run(lambda: self._fetch_one_pcf(code))
+
+    def _fetch_one_pcf(self, code):
+        self.log(f"正在采集上交所 {code} 当前 PCF...")
+        info, items = fetch_sse_pcf_for_fund(code)
+        info_count, item_count = self.db.upsert_pcf([info], items)
+        self.log(
+            f"上交所 {code} PCF 完成：公告日 {info.get('内容日期') or '-'}，"
+            f"信息 {info_count} 行，成分 {item_count} 行。"
+        )
+
+    def fetch_pcf_batch(self):
+        self._run(self._fetch_pcf_batch)
+
+    def _fetch_pcf_batch(self):
+        funds = self.db.list_fund_codes("SSE")
+        if not funds:
+            self.log("上交所 PCF 批量采集结束：ETF 表中没有上交所基金代码。")
+            return
+
+        configured_workers = normalize_worker_count(self.workers_var.get())
+        workers = min(configured_workers, 4)
+        self.log(f"开始批量采集上交所当前 PCF：{len(funds)} 只基金，线程 {workers}。")
+        completed = 0
+        written_info = 0
+        written_items = 0
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(fetch_sse_pcf_for_fund, row["fund_code"]): row["fund_code"]
+                for row in funds
+            }
+            for future in as_completed(futures):
+                code = futures[future]
+                try:
+                    info, items = future.result()
+                    info_count, item_count = self.db.upsert_pcf([info], items)
+                    written_info += info_count
+                    written_items += item_count
+                    completed += 1
+                    if completed == 1 or completed % 20 == 0 or completed == len(funds):
+                        self.log(f"PCF 批量进度 {completed}/{len(funds)}，最近完成 {code}。")
+                except Exception as exc:
+                    completed += 1
+                    self.log(f"PCF {code} 采集失败，已跳过：{exc}")
+        self.log(f"上交所 PCF 批量采集完成：信息 {written_info} 行，成分 {written_items} 行。")
 
     def _fetch_range_threaded(self, start, end, workers):
         dates = list(iter_weekdays(start, end))
