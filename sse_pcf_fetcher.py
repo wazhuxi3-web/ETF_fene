@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import json
+import time
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from urllib.parse import urlencode
@@ -341,6 +342,111 @@ def build_sse_pcf_download_url(fund_code: str, etf_type: str | None = None) -> s
     return "https://query.sse.com.cn/etfDownload/downloadETF2Bulletin.do?" + urlencode(params)
 
 
+def _decode_sse_download(raw: bytes | str) -> str:
+    if isinstance(raw, str):
+        return raw
+    if b"<SSEPortfolioCompositionFile" in raw[:500]:
+        return raw.decode("utf-8-sig")
+    return raw.decode("gb18030", errors="replace")
+
+
+def _legacy_market(code: str) -> str | None:
+    code = str(code or "").strip()
+    if code.startswith(("6", "68")):
+        return "上交所"
+    if code.startswith(("0", "3")):
+        return "深交所"
+    return None
+
+
+def parse_sse_pcf_legacy(
+    text: str,
+    fund_code: str,
+    api_info: dict | None = None,
+) -> tuple[dict, list[dict]]:
+    """Parse the pre-XML ETFMQ key/value and pipe-delimited format."""
+    api_info = api_info or {}
+    header: dict[str, str] = {}
+    component_lines: list[str] = []
+    in_components = False
+    for line in text.replace("\r", "").split("\n"):
+        stripped = line.strip()
+        if stripped == "TAGTAG":
+            in_components = True
+            continue
+        if not in_components:
+            if "=" in line:
+                key, value = line.split("=", 1)
+                header[key.strip()] = value.strip()
+        elif stripped and stripped != "ENDENDEND":
+            component_lines.append(line)
+
+    content_date = _format_sse_date(header.get("TradingDay") or api_info.get("TRADING_DAY"))
+    raw_info = {
+        "交易所": "SSE",
+        "基金代码": str(fund_code).strip(),
+        "基金名称": api_info.get("FUND_NAME"),
+        "基金管理公司名称": api_info.get("FUND_COMP_NAME"),
+        "最新公告日期": content_date,
+        "内容日期": content_date,
+        "现金差额": header.get("CashComponent"),
+        "最小申购、赎回单位净值": header.get("NAVperCU"),
+        "基金份额净值": header.get("NAV"),
+        "最小申购、赎回单位的预估现金部分": header.get("EstimateCashComponent"),
+        "现金替代比例上限": _xml_percent(header.get("MaxCashRatio")),
+        "是否需要公布IOPV": "是" if header.get("Publish") == "1" else "否",
+        "最小申购、赎回单位": header.get("CreationRedemptionUnit"),
+        "申购赎回的允许情况": api_info.get("CREATION_REDEMPTION"),
+        "申购赎回模式": _creation_mode(
+            api_info.get("CREATION_REDEMPTION_MECHANISM") or header.get("CreationRedemption")
+        ),
+    }
+    info = normalize_pcf_info(raw_info)
+
+    items = []
+    for line in component_lines:
+        fields = [field.strip() for field in line.split("|")]
+        if len(fields) < 4 or not fields[0]:
+            continue
+        field_count = len(fields)
+        fields += [""] * (7 - len(fields))
+        cash_amount = fields[6]
+        redemption_rate = fields[5]
+        if fields[3] == "2" and field_count <= 7 and fields[5] and not fields[6]:
+            cash_amount = fields[5]
+            redemption_rate = ""
+        raw_item = {
+            "交易所": "SSE",
+            "基金代码": str(fund_code).strip(),
+            "内容日期": content_date,
+            "证券代码": fields[0],
+            "证券简称": fields[1],
+            "股票数量": fields[2],
+            "现金替代标志": fields[3],
+            "申购现金替代溢价比例": _xml_percent(fields[4]),
+            "赎回现金替代折价比例": _xml_percent(redemption_rate),
+            "替代金额": cash_amount,
+            "挂牌市场": _legacy_market(fields[0]),
+        }
+        item = normalize_pcf_item(raw_item)
+        if item["证券代码"]:
+            items.append(item)
+    return info, items
+
+
+def parse_sse_pcf_download(
+    raw: bytes | str,
+    fund_code: str,
+    api_info: dict | None = None,
+) -> tuple[dict, list[dict]]:
+    text = _decode_sse_download(raw)
+    if text.lstrip().startswith("<"):
+        return parse_sse_pcf_xml(text, fund_code, api_info=api_info)
+    if "TAGTAG" in text and "TradingDay=" in text:
+        return parse_sse_pcf_legacy(text, fund_code, api_info=api_info)
+    raise ValueError("SSE PCF download is neither XML nor legacy ETFMQ text")
+
+
 def _parse_jsonp(text: str) -> dict:
     payload = text.strip()
     start = payload.find("{")
@@ -360,10 +466,16 @@ def fetch_sse_pcf_for_fund(
     *,
     opener=None,
     timeout: float = 30,
+    retry_attempts: int = 3,
+    retry_delay: float = 0.8,
 ) -> tuple[dict, list[dict]]:
     """Fetch one current SSE PCF; the public endpoint has no historical date argument."""
     opener = opener or urlopen
     code = str(fund_code).strip()
+    headers = {
+        "Referer": "https://etf.sse.com.cn/",
+        "User-Agent": "Mozilla/5.0 ETFDataCollector/1.0",
+    }
     info_url = "https://query.sse.com.cn/commonQuery.do?" + urlencode(
         {
             "isPagination": "false",
@@ -372,18 +484,26 @@ def fetch_sse_pcf_for_fund(
             "jsonCallBack": "codexCallback",
         }
     )
-    headers = {
-        "Referer": "https://etf.sse.com.cn/",
-        "User-Agent": "Mozilla/5.0 ETFDataCollector/1.0",
-    }
-    info_request = Request(info_url, headers=headers)
-    info_payload = _parse_jsonp(_read_sse(info_request, opener, timeout).decode("utf-8-sig"))
-    results = info_payload.get("result") or []
-    if not results:
-        raise ValueError(f"SSE returned no PCF metadata for {code}")
-    api_info = dict(results[0])
+    last_error = None
+    for attempt in range(max(1, int(retry_attempts))):
+        try:
+            info_request = Request(info_url, headers=headers)
+            info_payload = _parse_jsonp(
+                _read_sse(info_request, opener, timeout).decode("utf-8-sig")
+            )
+            results = info_payload.get("result") or []
+            if not results:
+                raise ValueError(f"SSE returned no PCF metadata for {code}")
+            api_info = dict(results[0])
 
-    xml_url = build_sse_pcf_download_url(code, api_info.get("ETF_TYPE"))
-    xml_request = Request(xml_url, headers=headers)
-    xml = _read_sse(xml_request, opener, timeout)
-    return parse_sse_pcf_xml(xml, code, api_info=api_info)
+            download_url = build_sse_pcf_download_url(code, api_info.get("ETF_TYPE"))
+            download_request = Request(download_url, headers=headers)
+            raw_download = _read_sse(download_request, opener, timeout)
+            return parse_sse_pcf_download(raw_download, code, api_info=api_info)
+        except (OSError, ValueError, ET.ParseError) as exc:
+            last_error = exc
+            if attempt + 1 >= max(1, int(retry_attempts)):
+                raise
+            if retry_delay > 0:
+                time.sleep(float(retry_delay) * (attempt + 1))
+    raise last_error or RuntimeError(f"SSE PCF fetch failed for {code}")

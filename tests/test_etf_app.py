@@ -34,6 +34,7 @@ from sse_pcf_fetcher import (
     normalize_pcf_item,
     parse_sse_pcf_html,
     parse_sse_pcf_xml,
+    parse_sse_pcf_download,
     build_sse_pcf_download_url,
     fetch_sse_pcf_for_fund,
 )
@@ -164,6 +165,58 @@ class PCFParserTests(unittest.TestCase):
         self.assertIn("fundCode=510010", url)
         self.assertIn("etfType=5", url)
         self.assertNotIn("startDate", url)
+
+    def test_parses_legacy_etfmq_download(self):
+        legacy = """[ETFMQ]\r
+Fundid1=510071\r
+CreationRedemptionUnit=500000\r
+MaxCashRatio=0.30000\r
+Publish=1\r
+CreationRedemption=1\r
+Recordnum=2\r
+EstimateCashComponent=-5368.00\r
+TradingDay=20200624\r
+PreTradingDay=20200623\r
+CashComponent=-3450.00\r
+NAVperCU=1080646.00\r
+NAV=2.161\r
+TAGTAG\r
+600031|三一重工|3200|1|0.10000||\r
+603444|吉比特|100|2||47666.000|\r
+ENDENDEND\r
+"""
+        info, items = parse_sse_pcf_download(
+            legacy.encode("gb18030"),
+            "510070",
+            api_info={"FUND_NAME": "上证综指ETF", "FUND_COMP_NAME": "测试基金公司"},
+        )
+        self.assertEqual(info["基金代码"], "510070")
+        self.assertEqual(info["内容日期"], "2020-06-24")
+        self.assertEqual(info["现金差额"], -3450.0)
+        self.assertEqual(info["现金替代比例上限"], 30.0)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[1]["证券代码"], "603444")
+        self.assertEqual(items[1]["替代金额"], 47666.0)
+
+    def test_retries_transient_download_failure(self):
+        calls = []
+        info_payload = 'cb({"result":[{"FUND_NAME":"治理ETF","TRADING_DAY":"20260713","ETF_TYPE":"5"}]})'
+        xml = "<SSEPortfolioCompositionFile><FundInstrumentID>510010</FundInstrumentID><TradingDay>20260713</TradingDay><ComponentList><Component><InstrumentID>600009</InstrumentID><Quantity>300</Quantity></Component></ComponentList></SSEPortfolioCompositionFile>"
+
+        def opener(request, timeout):
+            calls.append(request.full_url)
+            if len(calls) == 2:
+                raise OSError("temporary EOF")
+            return type("Response", (), {
+                "read": lambda self: (info_payload if "commonQuery.do" in request.full_url else xml).encode("utf-8"),
+                "__enter__": lambda self: self,
+                "__exit__": lambda self, *args: None,
+            })()
+
+        info, items = fetch_sse_pcf_for_fund("510010", opener=opener, retry_delay=0)
+        self.assertEqual(info["内容日期"], "2026-07-13")
+        self.assertEqual(len(items), 1)
+        self.assertEqual(len(calls), 4)
 
     def test_fetches_api_metadata_then_official_xml_download(self):
         calls = []

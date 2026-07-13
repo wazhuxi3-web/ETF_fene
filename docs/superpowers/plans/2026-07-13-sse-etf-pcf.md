@@ -6,7 +6,7 @@
 
 > **Execution note:** 上交所当前公开 PCF 接口只接受基金代码，返回当前公告日；历史日期参数会被忽略。本次实现因此采集当前公告日 PCF，并明确保留历史数据能力待后续接入公告档案，不伪造历史数据。
 
-**Architecture:** 新增 `sse_pcf_fetcher.py`，负责上交所 JSONP 元数据、官方 XML 下载和标准化；`etf_database.py` 新增两张表及幂等写入接口；`etf_gui.py` 增加单只/批量当前 PCF 采集入口并把控制区、统计区、日志区分开。复用现有 ETF 份额表作为上交所 ETF 代码来源，避免另造基金列表。
+**Architecture:** 新增 `sse_pcf_fetcher.py`，负责上交所 JSONP 元数据、官方 XML/ETFMQ 下载、退避重试和标准化；`etf_database.py` 新增两张表及幂等写入接口；`etf_gui.py` 增加单只/批量当前 PCF 采集入口并把控制区、统计区、日志区分开。复用现有 ETF 份额表作为上交所 ETF 代码来源，避免另造基金列表。
 
 **Tech Stack:** Python 标准库、`urllib`、`html.parser`、`sqlite3`、Tkinter、`unittest`。
 
