@@ -49,7 +49,7 @@ from szse_pcf_fetcher import (
     extract_szse_pcf_references,
     parse_szse_pcf_download,
 )
-from etf_gui import ETFApp, collection_panel_state
+from etf_gui import ETFApp, collection_panel_state, format_coverage_cell
 from etf_web_app import ETFWebServer, HTML, parse_web_endpoint
 
 
@@ -2393,6 +2393,35 @@ class PCFGuiTests(unittest.TestCase):
             "选择沪深两市时：上交所更新一次最新快照；深交所按所选日期区间采集。",
         )
 
+    def test_formats_share_and_component_coverage_cells(self):
+        self.assertEqual(
+            format_coverage_cell(
+                "share",
+                {
+                    "min_date": "2016-01-04",
+                    "max_date": "2026-07-10",
+                    "rows_count": 100,
+                    "fund_count": 12,
+                    "date_count": 2000,
+                },
+            ),
+            "2016-01-04 ~ 2026-07-10 | 100 行 / 12 只 / 2000 日",
+        )
+        self.assertEqual(
+            format_coverage_cell(
+                "component",
+                {
+                    "min_date": "2026-07-13",
+                    "max_date": "2026-07-14",
+                    "snapshot_count": 5,
+                    "fund_count": 2,
+                    "item_count": 100,
+                },
+            ),
+            "2026-07-13 ~ 2026-07-14 | 5 快照 / 2 只 / 100 成分",
+        )
+        self.assertEqual(format_coverage_cell("component", {"min_date": None}), "暂无数据")
+
     def test_gui_uses_unified_collection_form_and_independent_log_scrollbar(self):
         source = Path("etf_gui.py").read_text(encoding="utf-8-sig")
         build_ui = source[source.index("    def _build_ui"):source.index("    def log")]
@@ -2710,7 +2739,7 @@ class PCFGuiTests(unittest.TestCase):
             ) as check_pcf,
             patch("etf_gui.check_sse_connection") as check_sse,
         ):
-            app._test_connection_and_resume()
+            app._continue_paused_task()
 
         check_pcf.assert_called_once_with("2026-07-14")
         check_sse.assert_not_called()
@@ -2741,7 +2770,7 @@ class PCFGuiTests(unittest.TestCase):
             "etf_gui.check_szse_pcf_connection", return_value=(True, "PCF connected")
         ):
             with self.assertRaisesRegex(RuntimeError, "dispatch failed"):
-                app._test_connection_and_resume()
+                app._continue_paused_task()
 
         app._fetch_szse_pcf_dates.assert_called_once_with(
             paused_dates, "", True, mode="history", fallback_pending=False
@@ -2766,7 +2795,7 @@ class PCFGuiTests(unittest.TestCase):
         with patch(
             "etf_gui.check_szse_pcf_connection", return_value=(True, "PCF connected")
         ) as check_pcf:
-            app._test_connection_and_resume()
+            app._continue_paused_task()
 
         check_pcf.assert_called_once_with("2026-07-14")
         app.db.latest_stock_trading_date.assert_called_once_with("2026-07-14")
@@ -2793,7 +2822,7 @@ class PCFGuiTests(unittest.TestCase):
         with patch(
             "etf_gui.check_szse_pcf_connection", return_value=(True, "PCF connected")
         ):
-            app._test_connection_and_resume()
+            app._continue_paused_task()
 
         app.db.latest_stock_trading_date.assert_not_called()
         app._fetch_szse_pcf_dates.assert_called_once_with(
@@ -2809,7 +2838,7 @@ class PCFGuiTests(unittest.TestCase):
         with patch(
             "etf_gui.check_sse_connection", return_value=(True, "SSE connected")
         ):
-            app._test_connection_and_resume()
+            app._continue_paused_task()
 
         app._fetch_date.assert_called_once_with(
             "2026-07-10",
@@ -2836,6 +2865,141 @@ class PCFGuiTests(unittest.TestCase):
 
         self.assertIsNone(result)
         showerror.assert_called_once()
+
+    def test_share_connection_probe_checks_selected_exchanges_without_resuming(self):
+        app = self._app()
+        app.paused_task = ("single", "SSE", "2026-07-10", "2026-07-10")
+
+        with (
+            patch("etf_gui.check_sse_connection", return_value=(True, "SSE ok")) as sse,
+            patch(
+                "etf_gui.check_szse_download_connection", return_value=(True, "SZSE ok")
+            ) as szse,
+        ):
+            app._test_selected_connection(
+                "share", ("SSE", "SZSE"), "2026-07-14", ""
+            )
+
+        sse.assert_called_once_with("2026-07-14")
+        szse.assert_called_once_with("2026-07-14")
+        self.assertEqual(
+            app.paused_task, ("single", "SSE", "2026-07-10", "2026-07-10")
+        )
+
+    def test_sse_component_connection_probe_reads_without_writing(self):
+        app = self._app()
+        app.db.list_fund_codes.return_value = [
+            {"fund_code": "510010", "fund_name": "ETF A"}
+        ]
+
+        with patch(
+            "etf_gui.fetch_sse_pcf_for_fund",
+            return_value=(
+                {"基金代码": "510010", "内容日期": "2026-07-14"},
+                [{"证券代码": "600001"}],
+            ),
+        ) as fetch:
+            app._test_selected_connection("component", ("SSE",), "2026-07-14", "")
+
+        fetch.assert_called_once_with("510010")
+        app.db.replace_pcf_snapshot.assert_not_called()
+        app.db.upsert_pcf.assert_not_called()
+
+    def test_szse_component_connection_probe_uses_shared_date(self):
+        app = self._app()
+
+        with patch(
+            "etf_gui.check_szse_pcf_connection", return_value=(True, "SZSE PCF ok")
+        ) as check:
+            app._test_selected_connection(
+                "component", ("SZSE",), "2026-07-14", "159915"
+            )
+
+        check.assert_called_once_with("2026-07-14")
+
+    def test_continue_button_reflects_pause_and_busy_state(self):
+        app = self._app()
+        app.continue_button = Mock()
+        app.busy = False
+
+        app._update_continue_button()
+        app.continue_button.configure.assert_called_with(state="disabled")
+
+        app.paused_task = ("single", "SSE", "2026-07-14", "2026-07-14")
+        app._update_continue_button()
+        app.continue_button.configure.assert_called_with(state="normal")
+
+        app.busy = True
+        app._update_continue_button()
+        app.continue_button.configure.assert_called_with(state="disabled")
+
+    def test_continue_paused_task_does_nothing_without_saved_pause(self):
+        app = self._app()
+        app._run = Mock()
+
+        app.continue_paused_task()
+
+        app._run.assert_not_called()
+
+    def test_refresh_stats_updates_all_four_coverage_cells_from_one_query(self):
+        app = self._app()
+        app.coverage_vars = {
+            (kind, exchange): Mock()
+            for kind in ("share", "component")
+            for exchange in ("SSE", "SZSE")
+        }
+        app.db.get_collection_coverage.return_value = {
+            "share": {
+                "SSE": {
+                    "min_date": "2026-07-01",
+                    "max_date": "2026-07-14",
+                    "rows_count": 10,
+                    "fund_count": 2,
+                    "date_count": 5,
+                },
+                "SZSE": {"min_date": None},
+            },
+            "component": {
+                "SSE": {"min_date": None},
+                "SZSE": {
+                    "min_date": "2026-07-14",
+                    "max_date": "2026-07-14",
+                    "snapshot_count": 1,
+                    "fund_count": 1,
+                    "item_count": 20,
+                },
+            },
+        }
+
+        app._refresh_stats()
+
+        app.db.get_collection_coverage.assert_called_once_with()
+        app.coverage_vars[("share", "SSE")].set.assert_called_once_with(
+            "2026-07-01 ~ 2026-07-14 | 10 行 / 2 只 / 5 日"
+        )
+        app.coverage_vars[("share", "SZSE")].set.assert_called_once_with("暂无数据")
+        app.coverage_vars[("component", "SSE")].set.assert_called_once_with("暂无数据")
+        app.coverage_vars[("component", "SZSE")].set.assert_called_once_with(
+            "2026-07-14 ~ 2026-07-14 | 1 快照 / 1 只 / 20 成分"
+        )
+
+    def test_busy_state_disables_collection_controls_and_preserves_combo_mode(self):
+        app = self._app()
+        app.task_status_var = Mock()
+        app.exchange_combo = Mock()
+        regular_widget = Mock()
+        app.task_input_widgets = [regular_widget, app.exchange_combo]
+        app.continue_button = Mock()
+
+        app._set_busy_ui(True)
+        regular_widget.configure.assert_called_with(state="disabled")
+        app.exchange_combo.configure.assert_called_with(state="disabled")
+        app.task_status_var.set.assert_called_with("采集中")
+
+        app._set_busy_ui(False, "已暂停")
+        regular_widget.configure.assert_called_with(state="normal")
+        app.exchange_combo.configure.assert_called_with(state="readonly")
+        app.task_status_var.set.assert_called_with("已暂停")
 
 
 class ETFWebServerTests(unittest.TestCase):
@@ -2913,17 +3077,19 @@ class ETFGuiTests(unittest.TestCase):
         self.assertIn("fetch_szse_rows_via_browser_downloads", source)
         self.assertNotIn("validate_szse_download_batch_range(start, end)", source)
 
-    def test_gui_connection_test_uses_selected_exchange_when_not_paused(self):
+    def test_gui_connection_test_uses_current_selection_without_resuming(self):
         source = Path("etf_gui.py").read_text(encoding="utf-8")
 
-        self.assertIn("exchanges = (self.paused_task[1],) if self.paused_task", source)
-        self.assertIn("else self._selected_exchanges()", source)
+        self.assertIn("def test_selected_connection", source)
+        self.assertIn("exchanges = tuple(self._selected_exchanges())", source)
+        self.assertIn("def continue_paused_task", source)
+        self.assertNotIn("测试连通性/继续采集", source)
 
-    def test_gui_connection_test_uses_szse_browser_download_probe(self):
+    def test_gui_connection_test_uses_task_specific_szse_probe(self):
         source = Path("etf_gui.py").read_text(encoding="utf-8")
 
         self.assertIn("check_szse_download_connection", source)
-        self.assertNotIn("check_szse_connection(test_date)", source)
+        self.assertIn("check_szse_pcf_connection", source)
 
     def test_gui_entrypoint_writes_crash_log(self):
         source = Path("etf_gui.py").read_text(encoding="utf-8")

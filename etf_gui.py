@@ -129,6 +129,22 @@ def collection_panel_state(
     }
 
 
+def format_coverage_cell(kind: str, stats: dict) -> str:
+    if not stats or not stats.get("min_date"):
+        return "暂无数据"
+    if kind == "share":
+        return (
+            f"{stats['min_date']} ~ {stats['max_date']} | "
+            f"{stats['rows_count']} 行 / {stats['fund_count']} 只 / "
+            f"{stats['date_count']} 日"
+        )
+    return (
+        f"{stats['min_date']} ~ {stats['max_date']} | "
+        f"{stats['snapshot_count']} 快照 / {stats['fund_count']} 只 / "
+        f"{stats['item_count']} 成分"
+    )
+
+
 class ETFApp:
     def __init__(self, root):
         self.root = root
@@ -173,37 +189,41 @@ class ETFApp:
 
         content_frame = ttk.LabelFrame(collection_form, text="采集内容", padding=6)
         content_frame.grid(row=0, column=0, sticky="ew")
-        ttk.Radiobutton(
+        self.share_type_button = ttk.Radiobutton(
             content_frame,
             text="ETF 份额",
             value="share",
             variable=self.data_type_var,
             command=self._sync_collection_panel,
-        ).pack(side=tk.LEFT, padx=(2, 14))
-        ttk.Radiobutton(
+        )
+        self.share_type_button.pack(side=tk.LEFT, padx=(2, 14))
+        self.component_type_button = ttk.Radiobutton(
             content_frame,
             text="ETF 成分股",
             value="component",
             variable=self.data_type_var,
             command=self._sync_collection_panel,
-        ).pack(side=tk.LEFT)
+        )
+        self.component_type_button.pack(side=tk.LEFT)
 
         scope_frame = ttk.LabelFrame(collection_form, text="共同采集范围", padding=6)
         scope_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        ttk.Radiobutton(
+        self.single_mode_button = ttk.Radiobutton(
             scope_frame,
             text="单日",
             value="single",
             variable=self.date_mode_var,
             command=self._sync_collection_panel,
-        ).grid(row=0, column=0, padx=(2, 8), pady=2)
-        ttk.Radiobutton(
+        )
+        self.single_mode_button.grid(row=0, column=0, padx=(2, 8), pady=2)
+        self.range_mode_button = ttk.Radiobutton(
             scope_frame,
             text="日期区间",
             value="range",
             variable=self.date_mode_var,
             command=self._sync_collection_panel,
-        ).grid(row=0, column=1, padx=(0, 12), pady=2)
+        )
+        self.range_mode_button.grid(row=0, column=1, padx=(0, 12), pady=2)
 
         self.date_input_host = ttk.Frame(scope_frame)
         self.date_input_host.grid(row=0, column=2, sticky="w")
@@ -291,10 +311,33 @@ class ETFApp:
             collection_form, text="数据库覆盖范围", padding=6
         )
         coverage_frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
-        self.coverage_placeholder_var = tk.StringVar(value="正在读取数据库统计...")
-        ttk.Label(coverage_frame, textvariable=self.coverage_placeholder_var).pack(
-            anchor="w"
+        coverage_frame.columnconfigure(1, weight=1)
+        coverage_frame.columnconfigure(2, weight=1)
+        ttk.Label(coverage_frame, text="数据类型").grid(
+            row=0, column=0, sticky="w", padx=(0, 10)
         )
+        ttk.Label(coverage_frame, text="上交所").grid(
+            row=0, column=1, sticky="w", padx=4
+        )
+        ttk.Label(coverage_frame, text="深交所").grid(
+            row=0, column=2, sticky="w", padx=4
+        )
+        self.coverage_vars = {
+            (kind, exchange): tk.StringVar(value="正在读取...")
+            for kind in ("share", "component")
+            for exchange in ("SSE", "SZSE")
+        }
+        for row, (kind, label) in enumerate(
+            (("share", "ETF 份额"), ("component", "ETF 成分股")), start=1
+        ):
+            ttk.Label(coverage_frame, text=label).grid(
+                row=row, column=0, sticky="w", padx=(0, 10), pady=2
+            )
+            for column, exchange in enumerate(("SSE", "SZSE"), start=1):
+                ttk.Label(
+                    coverage_frame,
+                    textvariable=self.coverage_vars[(kind, exchange)],
+                ).grid(row=row, column=column, sticky="w", padx=4, pady=2)
 
         web_form = ttk.LabelFrame(frame, text="网页", padding=10)
         web_form.pack(fill=tk.X, pady=(0, 10))
@@ -307,10 +350,17 @@ class ETFApp:
         toolbar = ttk.Frame(frame)
         toolbar.pack(fill=tk.X, pady=4)
         ttk.Button(toolbar, text="刷新统计", command=self._refresh_stats).pack(side=tk.LEFT, padx=4)
-        ttk.Button(toolbar, text="测试连通性/继续采集", command=self.test_connection_and_resume).pack(side=tk.LEFT, padx=4)
+        self.test_connection_button = ttk.Button(
+            toolbar, text="测试连接", command=self.test_selected_connection
+        )
+        self.test_connection_button.pack(side=tk.LEFT, padx=4)
+        self.continue_button = ttk.Button(
+            toolbar, text="继续暂停任务", command=self.continue_paused_task
+        )
+        self.continue_button.pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="网络诊断", command=self.diagnose).pack(side=tk.LEFT, padx=4)
-        self.stats_var = tk.StringVar()
-        ttk.Label(toolbar, textvariable=self.stats_var).pack(side=tk.LEFT, padx=12)
+        ttk.Label(toolbar, text="状态:").pack(side=tk.LEFT, padx=(14, 4))
+        ttk.Label(toolbar, textvariable=self.task_status_var).pack(side=tk.LEFT)
 
         log_frame = ttk.LabelFrame(frame, text="运行日志", padding=6)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
@@ -323,6 +373,10 @@ class ETFApp:
         self.log_text.configure(yscrollcommand=log_scrollbar.set)
 
         self.task_input_widgets = [
+            self.share_type_button,
+            self.component_type_button,
+            self.single_mode_button,
+            self.range_mode_button,
             self.single_date_entry,
             self.start_date_entry,
             self.end_date_entry,
@@ -331,8 +385,10 @@ class ETFApp:
             self.pcf_code_entry,
             self.pcf_replace_check,
             self.start_collection_button,
+            self.test_connection_button,
         ]
         self._sync_collection_panel()
+        self._update_continue_button()
 
     def _sync_collection_panel(self):
         state = collection_panel_state(
@@ -382,7 +438,7 @@ class ETFApp:
         if self.busy:
             messagebox.showinfo("提示", "正在采集中，请稍等。")
             return
-        self.busy = True
+        self._set_busy_ui(True)
 
         def worker():
             try:
@@ -391,10 +447,34 @@ class ETFApp:
                 _write_crash_log("background task failed")
                 self.log(f"失败: {exc}")
             finally:
-                self.busy = False
-                self.root.after(0, self._refresh_stats)
+                status = "已暂停" if self.paused_task or self.paused_pcf_task else "空闲"
+                self.root.after(0, lambda: self._finish_background_task(status))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_background_task(self, status):
+        self._set_busy_ui(False, status)
+        self._refresh_stats()
+
+    def _set_busy_ui(self, busy: bool, status: str | None = None):
+        self.busy = busy
+        self.task_status_var.set(status or ("采集中" if busy else "空闲"))
+        for widget in self.task_input_widgets:
+            if busy:
+                widget.configure(state="disabled")
+            elif widget is self.exchange_combo:
+                widget.configure(state="readonly")
+            else:
+                widget.configure(state="normal")
+        self._update_continue_button()
+
+    def _update_continue_button(self):
+        state = (
+            "normal"
+            if not self.busy and (self.paused_pcf_task or self.paused_task)
+            else "disabled"
+        )
+        self.continue_button.configure(state=state)
 
     def fetch_single(self):
         date = self.date_var.get().strip()
@@ -642,7 +722,7 @@ class ETFApp:
                 "fallback_pending": fallback_pending,
             }
             self.log(f"深交所 PCF {exc.trade_date} 页面查询失败，已暂停且不会跳过该日期: {exc}")
-            self.log("请先点“测试连通性/继续采集”；测通后会从暂停日期继续。")
+            self.log("请先点“测试连接”；测通后点“继续暂停任务”从该日期继续。")
             return None
 
     def _fetch_range_threaded(self, start, end, workers):
@@ -675,7 +755,7 @@ class ETFApp:
                 except ETFNetworkError as exc:
                     self.paused_task = ("range", "SSE", date, end)
                     self.log(f"{date} 接口连接失败，区间采集已暂停: {exc}")
-                    self.log("请先点“测试连通性/继续采集”；测通后会从暂停日期继续。")
+                    self.log("请先点“测试连接”；测通后点“继续暂停任务”从该日期继续。")
                     break
                 if not rows:
                     self.log(f"{date} 没有返回ETF数据。")
@@ -765,7 +845,7 @@ class ETFApp:
         except ETFNetworkError as exc:
             self.paused_task = pause_task
             self.log(f"接口连接失败，已暂停采集: {exc}")
-            self.log("请先点“测试连通性/继续采集”；测通后会从暂停日期继续。")
+            self.log("请先点“测试连接”；测通后点“继续暂停任务”从该日期继续。")
             return 0
         except Exception as exc:
             if exchange == "SZSE":
@@ -780,10 +860,67 @@ class ETFApp:
         self.log(f"{date} 通过{source}获取 {len(rows)} 行，写入/更新 {count} 行。")
         return count
 
-    def test_connection_and_resume(self):
-        self._run(self._test_connection_and_resume)
+    def test_selected_connection(self):
+        test_date = (
+            self.date_var.get().strip()
+            if self.date_mode_var.get() == "single"
+            else self.end_var.get().strip()
+        )
+        try:
+            self._validate_date(test_date)
+        except ValueError:
+            messagebox.showerror("日期错误", "请输入 YYYY-MM-DD 格式的日期。")
+            return
+        code = ""
+        if self.data_type_var.get() == "component":
+            code = self._pcf_code_or_none()
+            if code is None:
+                return
+        data_type = self.data_type_var.get()
+        exchanges = tuple(self._selected_exchanges())
+        self._run(
+            lambda: self._test_selected_connection(
+                data_type, exchanges, test_date, code
+            )
+        )
 
-    def _test_connection_and_resume(self):
+    def _test_selected_connection(self, data_type, exchanges, test_date, code):
+        for exchange in exchanges:
+            if data_type == "share":
+                if exchange == "SZSE":
+                    _ok, message = check_szse_download_connection(test_date)
+                else:
+                    _ok, message = check_sse_connection(test_date)
+                self.log(message)
+                continue
+
+            if exchange == "SZSE":
+                _ok, message = check_szse_pcf_connection(test_date)
+                self.log(message)
+                continue
+
+            probe_code = code
+            if not probe_code:
+                funds = self.db.list_fund_codes("SSE")
+                if not funds:
+                    self.log("上交所成分股连接测试失败：ETF 表中没有上交所基金代码。")
+                    continue
+                probe_code = funds[0]["fund_code"]
+            try:
+                info, items = fetch_sse_pcf_for_fund(probe_code)
+                self.log(
+                    f"上交所成分股连接正常：{probe_code}，"
+                    f"内容日期 {info.get('内容日期') or '-'}，成分 {len(items)} 行。"
+                )
+            except Exception as exc:
+                self.log(f"上交所成分股连接失败：{probe_code}，{exc}")
+
+    def continue_paused_task(self):
+        if not self.paused_pcf_task and not self.paused_task:
+            return
+        self._run(self._continue_paused_task)
+
+    def _continue_paused_task(self):
         if self.paused_pcf_task:
             task = self.paused_pcf_task
             dates = list(task["dates"])
@@ -817,24 +954,7 @@ class ETFApp:
                 self.paused_pcf_task = None
             return
 
-        if self.paused_task and len(self.paused_task) == 4:
-            test_date = self.paused_task[2]
-        else:
-            test_date = self.date_var.get().strip()
-        try:
-            self._validate_date(test_date)
-        except ValueError:
-            test_date = datetime.now().strftime("%Y-%m-%d")
-        exchanges = (self.paused_task[1],) if self.paused_task and len(self.paused_task) == 4 else self._selected_exchanges()
-        all_ok = True
-        for exchange in exchanges:
-            if exchange == "SZSE":
-                ok, message = check_szse_download_connection(test_date)
-            else:
-                ok, message = check_sse_connection(test_date)
-            self.log(message)
-            all_ok = all_ok and ok
-        if not all_ok or not self.paused_task:
+        if not self.paused_task:
             return
 
         if len(self.paused_task) == 3:
@@ -842,6 +962,14 @@ class ETFApp:
             exchange = "SSE"
         else:
             mode, exchange, current, end = self.paused_task
+        if exchange == "SZSE":
+            ok, message = check_szse_download_connection(current)
+        else:
+            ok, message = check_sse_connection(current)
+        self.log(message)
+        if not ok:
+            return
+
         self.paused_task = None
         if mode == "single":
             self.log(f"继续采集单日 {current}。")
@@ -881,11 +1009,12 @@ class ETFApp:
             self.log("  " + line)
 
     def _refresh_stats(self):
-        stats = self.db.get_stats()
-        self.stats_var.set(
-            f"ETF表: {stats.get('rows_count') or 0} 行 / {stats.get('fund_count') or 0} 只 "
-            f"{stats.get('min_date') or '-'} ~ {stats.get('max_date') or '-'}"
-        )
+        coverage = self.db.get_collection_coverage()
+        for kind in ("share", "component"):
+            for exchange in ("SSE", "SZSE"):
+                self.coverage_vars[(kind, exchange)].set(
+                    format_coverage_cell(kind, coverage[kind][exchange])
+                )
 
     @staticmethod
     def _validate_date(value):
