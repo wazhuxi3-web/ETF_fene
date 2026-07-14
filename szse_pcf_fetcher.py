@@ -531,6 +531,7 @@ class SZSEPCFBrowserSession:
             raise RuntimeError("深交所 PCF 浏览器会话尚未打开")
 
         download_page = None
+        operation_error = None
         try:
             download_page = self.context.new_page()
             with download_page.expect_response(
@@ -543,20 +544,26 @@ class SZSEPCFBrowserSession:
             final_response = final_response_info.value
             download_page.wait_for_url("**/files/text/ETFDown/**", timeout=30000)
             return final_response.body()
-        except SZSEPCFPageError:
+        except SZSEPCFPageError as exc:
+            operation_error = exc
             raise
         except Exception as exc:
             if _is_browser_session_fatal(exc):
-                raise SZSEPCFPageError(reference.content_date, str(exc)) from exc
+                operation_error = SZSEPCFPageError(reference.content_date, str(exc))
+                raise operation_error from exc
+            operation_error = exc
             raise
         finally:
             if download_page is not None:
                 try:
                     download_page.close()
                 except Exception as exc:
-                    if _is_browser_session_fatal(exc):
+                    if operation_error is not None:
+                        pass
+                    elif _is_browser_session_fatal(exc):
                         raise SZSEPCFPageError(reference.content_date, str(exc)) from exc
-                    raise
+                    else:
+                        raise
 
 
 def check_szse_pcf_connection(
