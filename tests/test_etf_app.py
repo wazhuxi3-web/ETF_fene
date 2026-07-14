@@ -1991,6 +1991,152 @@ class ETFDatabaseTests(unittest.TestCase):
             self.assertEqual(history[0]["volume"], 123456.0)
 
 
+class CollectionCoverageDatabaseTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db = ETFDatabase(Path(self.temp_dir.name) / "stock_data.db")
+        self.db.initialize()
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def _info(exchange, fund_code, content_date):
+        return {
+            "交易所": exchange,
+            "基金代码": fund_code,
+            "基金名称": f"ETF {fund_code}",
+            "最新公告日期": content_date,
+            "内容日期": content_date,
+        }
+
+    @staticmethod
+    def _item(exchange, fund_code, content_date, security_code):
+        return {
+            "交易所": exchange,
+            "基金代码": fund_code,
+            "内容日期": content_date,
+            "证券代码": security_code,
+            "证券简称": f"证券 {security_code}",
+            "挂牌市场": exchange,
+        }
+
+    def test_returns_all_empty_coverage_cells(self):
+        coverage = self.db.get_collection_coverage()
+
+        self.assertEqual(
+            coverage["share"]["SSE"],
+            {
+                "min_date": None,
+                "max_date": None,
+                "rows_count": 0,
+                "fund_count": 0,
+                "date_count": 0,
+            },
+        )
+        self.assertEqual(coverage["share"]["SZSE"], coverage["share"]["SSE"])
+        self.assertEqual(
+            coverage["component"]["SSE"],
+            {
+                "min_date": None,
+                "max_date": None,
+                "snapshot_count": 0,
+                "fund_count": 0,
+                "item_count": 0,
+            },
+        )
+        self.assertEqual(
+            coverage["component"]["SZSE"], coverage["component"]["SSE"]
+        )
+
+    def test_groups_share_and_component_coverage_by_exchange(self):
+        self.db.upsert_rows(
+            [
+                {
+                    "trade_date": "2026-07-01",
+                    "exchange": "SSE",
+                    "fund_code": "510010",
+                    "fund_name": "ETF A",
+                    "total_share": 100,
+                },
+                {
+                    "trade_date": "2026-07-03",
+                    "exchange": "SSE",
+                    "fund_code": "510010",
+                    "fund_name": "ETF A",
+                    "total_share": 110,
+                },
+                {
+                    "trade_date": "2026-07-03",
+                    "exchange": "SSE",
+                    "fund_code": "510020",
+                    "fund_name": "ETF B",
+                    "total_share": 120,
+                },
+                {
+                    "trade_date": "2026-07-02",
+                    "exchange": "SZSE",
+                    "fund_code": "159001",
+                    "fund_name": "ETF C",
+                    "total_share": 200,
+                },
+                {
+                    "trade_date": "2026-07-04",
+                    "exchange": "SZSE",
+                    "fund_code": "159002",
+                    "fund_name": "ETF D",
+                    "total_share": 210,
+                },
+            ]
+        )
+
+        sse_infos = [
+            self._info("SSE", "510010", "2026-07-13"),
+            self._info("SSE", "510010", "2026-07-14"),
+        ]
+        sse_items = [
+            self._item("SSE", "510010", "2026-07-13", "600001"),
+            self._item("SSE", "510010", "2026-07-13", "600002"),
+            self._item("SSE", "510010", "2026-07-14", "600001"),
+            self._item("SSE", "510010", "2026-07-14", "600003"),
+        ]
+        szse_infos = [
+            self._info("SZSE", "159001", "2026-07-12"),
+            self._info("SZSE", "159002", "2026-07-14"),
+        ]
+        szse_items = [
+            self._item("SZSE", "159001", "2026-07-12", "000001"),
+            self._item("SZSE", "159001", "2026-07-12", "000002"),
+            self._item("SZSE", "159002", "2026-07-14", "300001"),
+        ]
+        self.db.upsert_pcf(sse_infos + szse_infos, sse_items + szse_items)
+
+        coverage = self.db.get_collection_coverage()
+
+        self.assertEqual(
+            coverage["share"]["SSE"],
+            {
+                "min_date": "2026-07-01",
+                "max_date": "2026-07-03",
+                "rows_count": 3,
+                "fund_count": 2,
+                "date_count": 2,
+            },
+        )
+        self.assertEqual(coverage["share"]["SZSE"]["max_date"], "2026-07-04")
+        self.assertEqual(
+            coverage["component"]["SSE"],
+            {
+                "min_date": "2026-07-13",
+                "max_date": "2026-07-14",
+                "snapshot_count": 2,
+                "fund_count": 1,
+                "item_count": 4,
+            },
+        )
+        self.assertEqual(coverage["component"]["SZSE"]["item_count"], 3)
+
+
 class PCFDatabaseTests(unittest.TestCase):
     def _info(self, date="2026-07-13"):
         return {

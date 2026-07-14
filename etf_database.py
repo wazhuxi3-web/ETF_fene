@@ -566,3 +566,91 @@ class ETFDatabase:
                 """
             ).fetchone()
             return dict(row)
+
+    def get_collection_coverage(self) -> dict[str, dict[str, dict]]:
+        result = {
+            "share": {
+                exchange: {
+                    "min_date": None,
+                    "max_date": None,
+                    "rows_count": 0,
+                    "fund_count": 0,
+                    "date_count": 0,
+                }
+                for exchange in ("SSE", "SZSE")
+            },
+            "component": {
+                exchange: {
+                    "min_date": None,
+                    "max_date": None,
+                    "snapshot_count": 0,
+                    "fund_count": 0,
+                    "item_count": 0,
+                }
+                for exchange in ("SSE", "SZSE")
+            },
+        }
+
+        with closing(self.connect()) as conn:
+            share_rows = conn.execute(
+                """
+                SELECT exchange,
+                       MIN(trade_date) AS min_date,
+                       MAX(trade_date) AS max_date,
+                       COUNT(*) AS rows_count,
+                       COUNT(DISTINCT fund_code) AS fund_count,
+                       COUNT(DISTINCT trade_date) AS date_count
+                FROM ETF
+                GROUP BY exchange
+                """
+            ).fetchall()
+            info_rows = conn.execute(
+                """
+                SELECT "交易所" AS exchange,
+                       MIN("内容日期") AS min_date,
+                       MAX("内容日期") AS max_date,
+                       COUNT(*) AS snapshot_count,
+                       COUNT(DISTINCT "基金代码") AS fund_count
+                FROM ETF_INFO
+                GROUP BY "交易所"
+                """
+            ).fetchall()
+            item_rows = conn.execute(
+                """
+                SELECT "交易所" AS exchange, COUNT(*) AS item_count
+                FROM ETF_ITEM
+                GROUP BY "交易所"
+                """
+            ).fetchall()
+
+        for row in share_rows:
+            exchange = row["exchange"]
+            if exchange not in result["share"]:
+                continue
+            result["share"][exchange].update(
+                min_date=row["min_date"],
+                max_date=row["max_date"],
+                rows_count=int(row["rows_count"]),
+                fund_count=int(row["fund_count"]),
+                date_count=int(row["date_count"]),
+            )
+
+        for row in info_rows:
+            exchange = row["exchange"]
+            if exchange not in result["component"]:
+                continue
+            result["component"][exchange].update(
+                min_date=row["min_date"],
+                max_date=row["max_date"],
+                snapshot_count=int(row["snapshot_count"]),
+                fund_count=int(row["fund_count"]),
+            )
+
+        for row in item_rows:
+            exchange = row["exchange"]
+            if exchange in result["component"]:
+                result["component"][exchange]["item_count"] = int(
+                    row["item_count"]
+                )
+
+        return result
