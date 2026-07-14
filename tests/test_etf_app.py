@@ -49,7 +49,7 @@ from szse_pcf_fetcher import (
     extract_szse_pcf_references,
     parse_szse_pcf_download,
 )
-from etf_gui import ETFApp
+from etf_gui import ETFApp, collection_panel_state
 from etf_web_app import ETFWebServer, HTML, parse_web_endpoint
 
 
@@ -2372,18 +2372,220 @@ class PCFGuiTests(unittest.TestCase):
         app._selected_exchanges = Mock(return_value=("SSE",))
         return app
 
-    def test_gui_keeps_pcf_actions_and_independent_log_scrollbar(self):
+    def test_collection_panel_state_switches_task_specific_controls(self):
+        self.assertEqual(
+            collection_panel_state("share", "range", "沪深两市"),
+            {
+                "show_single_date": False,
+                "show_range_dates": True,
+                "show_workers": True,
+                "show_pcf_options": False,
+                "button_text": "开始采集份额",
+                "notice": "",
+            },
+        )
+        self.assertEqual(
+            collection_panel_state("component", "single", "上交所")["notice"],
+            "上交所成分股仅更新最新快照，所选日期范围不适用。",
+        )
+        self.assertEqual(
+            collection_panel_state("component", "range", "沪深两市")["notice"],
+            "选择沪深两市时：上交所更新一次最新快照；深交所按所选日期区间采集。",
+        )
+
+    def test_gui_uses_unified_collection_form_and_independent_log_scrollbar(self):
         source = Path("etf_gui.py").read_text(encoding="utf-8-sig")
+        build_ui = source[source.index("    def _build_ui"):source.index("    def log")]
         self.assertIn("fetch_sse_pcf_for_fund", source)
-        self.assertIn("采集当前 PCF", source)
-        self.assertIn("批量采集上交所当前 PCF", source)
-        self.assertIn("ETF成分股（PCF）", source)
-        self.assertIn("采集深交所当前 PCF", source)
-        self.assertIn("采集深交所历史 PCF", source)
+        self.assertNotIn("采集当前 PCF", build_ui)
+        self.assertNotIn("批量采集上交所当前 PCF", build_ui)
+        self.assertNotIn("采集深交所当前 PCF", build_ui)
+        self.assertNotIn("采集深交所历史 PCF", build_ui)
+        self.assertIn("ETF 数据采集", build_ui)
+        self.assertIn("共同采集范围", build_ui)
+        self.assertIn("ETF 份额", build_ui)
+        self.assertIn("ETF 成分股", build_ui)
+        self.assertIn("数据库覆盖范围", build_ui)
         self.assertIn("重新采集已有快照", source)
         self.assertIn("log_frame", source)
         self.assertIn("log_scrollbar", source)
         self.assertIn("yscrollcommand=log_scrollbar.set", source)
+
+    def _dispatch_app(self, exchange="上交所", date_mode="range", code="", replace=False):
+        app = self._app()
+        app.exchange_var = Mock()
+        app.exchange_var.get.return_value = exchange
+        app.date_mode_var = Mock()
+        app.date_mode_var.get.return_value = date_mode
+        app.date_var = Mock()
+        app.date_var.get.return_value = "2026-07-14"
+        app.start_var = Mock()
+        app.start_var.get.return_value = "2026-07-01"
+        app.end_var = Mock()
+        app.end_var.get.return_value = "2026-07-14"
+        app.pcf_code_var = Mock()
+        app.pcf_code_var.get.return_value = code
+        app.pcf_replace_var = Mock()
+        app.pcf_replace_var.get.return_value = replace
+        app._selected_exchanges = ETFApp._selected_exchanges.__get__(app)
+        app._run = Mock()
+        app._fetch_sse_components = Mock()
+        app._fetch_szse_pcf_current = Mock()
+        app._fetch_szse_pcf_history = Mock()
+        return app
+
+    def test_component_dispatch_sse_range_fetches_latest_once(self):
+        app = self._dispatch_app(exchange="上交所", date_mode="range")
+
+        app.fetch_selected_components()
+        task = app._run.call_args.args[0]
+        task()
+
+        app._fetch_sse_components.assert_called_once_with("", False)
+        app._fetch_szse_pcf_current.assert_not_called()
+        app._fetch_szse_pcf_history.assert_not_called()
+
+    def test_component_dispatch_both_range_fetches_sse_then_szse(self):
+        app = self._dispatch_app(exchange="沪深两市", date_mode="range")
+
+        app.fetch_selected_components()
+        task = app._run.call_args.args[0]
+        task()
+
+        app._fetch_sse_components.assert_called_once_with("", False)
+        app._fetch_szse_pcf_history.assert_called_once_with(
+            "2026-07-01", "2026-07-14", "", False
+        )
+
+    def test_component_dispatch_single_date_uses_selected_szse_date(self):
+        app = self._dispatch_app(
+            exchange="深交所", date_mode="single", code="159915"
+        )
+
+        app.fetch_selected_components()
+        app._run.call_args.args[0]()
+
+        app._fetch_szse_pcf_current.assert_called_once_with(
+            "159915",
+            False,
+            current_date="2026-07-14",
+            fallback_pending=False,
+        )
+
+    def test_component_dispatch_stops_before_szse_when_sse_pauses(self):
+        app = self._dispatch_app(exchange="沪深两市", date_mode="range")
+
+        def pause_sse(*_args):
+            app.paused_pcf_task = {"mode": "sse", "codes": ["510010"]}
+
+        app._fetch_sse_components.side_effect = pause_sse
+        app.fetch_selected_components()
+        app._run.call_args.args[0]()
+
+        app._fetch_szse_pcf_history.assert_not_called()
+
+    def test_component_code_rejects_full_width_digits(self):
+        app = self._dispatch_app(code="１５９９１５")
+
+        with patch("etf_gui.messagebox.showerror") as showerror:
+            app.fetch_selected_components()
+
+        app._run.assert_not_called()
+        showerror.assert_called_once()
+
+    def test_component_range_rejects_reversed_dates(self):
+        app = self._dispatch_app(date_mode="range")
+        app.start_var.get.return_value = "2026-07-15"
+
+        with patch("etf_gui.messagebox.showerror") as showerror:
+            app.fetch_selected_components()
+
+        app._run.assert_not_called()
+        showerror.assert_called_once()
+
+    def test_component_overwrite_requires_confirmation(self):
+        app = self._dispatch_app(replace=True)
+
+        with patch("etf_gui.messagebox.askyesno", return_value=False) as askyesno:
+            app.fetch_selected_components()
+
+        askyesno.assert_called_once()
+        app._run.assert_not_called()
+
+    def test_start_selected_collection_routes_by_content_and_date_mode(self):
+        app = self._dispatch_app()
+        app.fetch_selected_components = Mock()
+        app.fetch_single = Mock()
+        app.fetch_range = Mock()
+
+        app.data_type_var = Mock()
+        app.data_type_var.get.return_value = "component"
+        app.start_selected_collection()
+        app.fetch_selected_components.assert_called_once()
+
+        app.data_type_var.get.return_value = "share"
+        app.date_mode_var.get.return_value = "single"
+        app.start_selected_collection()
+        app.fetch_single.assert_called_once()
+
+        app.date_mode_var.get.return_value = "range"
+        app.start_selected_collection()
+        app.fetch_range.assert_called_once()
+
+    def test_sse_components_skip_complete_and_replace_incomplete_snapshots(self):
+        app = self._app()
+        app.db.list_fund_codes.return_value = [
+            {"fund_code": "510010", "fund_name": "ETF A"},
+            {"fund_code": "510020", "fund_name": "ETF B"},
+        ]
+        app.db.pcf_is_complete.side_effect = [True, False]
+
+        def fetched(code):
+            return (
+                {
+                    "交易所": "SSE",
+                    "基金代码": code,
+                    "内容日期": "2026-07-14",
+                },
+                [{"证券代码": "600001"}],
+            )
+
+        with patch("etf_gui.fetch_sse_pcf_for_fund", side_effect=fetched) as fetch:
+            app._fetch_sse_components("", False)
+
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(app.db.pcf_is_complete.call_count, 2)
+        app.db.replace_pcf_snapshot.assert_called_once_with(
+            {
+                "交易所": "SSE",
+                "基金代码": "510020",
+                "内容日期": "2026-07-14",
+            },
+            [{"证券代码": "600001"}],
+            source="sse_pcf",
+        )
+
+    def test_sse_component_overwrite_uses_only_explicit_code(self):
+        app = self._app()
+        info = {
+            "交易所": "SSE",
+            "基金代码": "510010",
+            "内容日期": "2026-07-14",
+        }
+        items = [{"证券代码": "600001"}]
+        app.db.replace_pcf_snapshot.return_value = (1, 1)
+
+        with patch(
+            "etf_gui.fetch_sse_pcf_for_fund", return_value=(info, items)
+        ) as fetch:
+            app._fetch_sse_components("510010", True)
+
+        app.db.list_fund_codes.assert_not_called()
+        app.db.pcf_is_complete.assert_not_called()
+        fetch.assert_called_once_with("510010")
+        app.db.replace_pcf_snapshot.assert_called_once_with(
+            info, items, source="sse_pcf"
+        )
 
     def test_current_queries_today_then_latest_stock_day_after_zero_discovery(self):
         app = self._app()

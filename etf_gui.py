@@ -110,17 +110,41 @@ def _mark_shutdown() -> None:
     _append_runtime_log("shutdown")
 
 
+def collection_panel_state(
+    data_type: str, date_mode: str, exchange_label: str
+) -> dict:
+    is_component = data_type == "component"
+    notice = ""
+    if is_component and exchange_label == "上交所":
+        notice = "上交所成分股仅更新最新快照，所选日期范围不适用。"
+    elif is_component and exchange_label == "沪深两市":
+        notice = "选择沪深两市时：上交所更新一次最新快照；深交所按所选日期区间采集。"
+    return {
+        "show_single_date": date_mode == "single",
+        "show_range_dates": date_mode == "range",
+        "show_workers": not is_component,
+        "show_pcf_options": is_component,
+        "button_text": "开始采集成分股" if is_component else "开始采集份额",
+        "notice": notice,
+    }
+
+
 class ETFApp:
     def __init__(self, root):
         self.root = root
         self.root.title("ETF份额采集与曲线")
-        self.root.geometry("760x520")
+        self.root.geometry("880x640")
+        self.root.minsize(820, 600)
         self.db = ETFDatabase(DEFAULT_DB_PATH)
         self.db.initialize()
         self.server = ETFWebServer(DEFAULT_DB_PATH)
         self.web_host_var = tk.StringVar(value="127.0.0.1")
         self.web_port_var = tk.StringVar(value="1234")
         self.exchange_var = tk.StringVar(value="上交所")
+        self.date_mode_var = tk.StringVar(value="single")
+        self.data_type_var = tk.StringVar(value="share")
+        self.task_status_var = tk.StringVar(value="空闲")
+        self.collection_notice_var = tk.StringVar()
         self.pcf_code_var = tk.StringVar()
         self.pcf_replace_var = tk.BooleanVar(value=False)
         self.busy = False
@@ -136,56 +160,141 @@ class ETFApp:
         db_text = f"数据库: {DEFAULT_DB_PATH}"
         ttk.Label(frame, text=db_text).pack(anchor="w")
 
-        form = ttk.LabelFrame(frame, text="采集", padding=10)
-        form.pack(fill=tk.X, pady=10)
-
         today = datetime.now().strftime("%Y-%m-%d")
         last_month = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-
-        ttk.Label(form, text="单日").grid(row=0, column=0, padx=4, pady=4)
         self.date_var = tk.StringVar(value=today)
-        ttk.Entry(form, textvariable=self.date_var, width=14).grid(row=0, column=1, padx=4)
-        ttk.Button(form, text="采集单日全量ETF", command=self.fetch_single).grid(row=0, column=2, padx=4)
-        ttk.Label(form, text="交易所").grid(row=0, column=3, padx=4)
-        ttk.Combobox(
-            form,
+        self.start_var = tk.StringVar(value=last_month)
+        self.end_var = tk.StringVar(value=today)
+        self.workers_var = tk.StringVar(value="16")
+
+        collection_form = ttk.LabelFrame(frame, text="ETF 数据采集", padding=10)
+        collection_form.pack(fill=tk.X, pady=10)
+        collection_form.columnconfigure(0, weight=1)
+
+        content_frame = ttk.LabelFrame(collection_form, text="采集内容", padding=6)
+        content_frame.grid(row=0, column=0, sticky="ew")
+        ttk.Radiobutton(
+            content_frame,
+            text="ETF 份额",
+            value="share",
+            variable=self.data_type_var,
+            command=self._sync_collection_panel,
+        ).pack(side=tk.LEFT, padx=(2, 14))
+        ttk.Radiobutton(
+            content_frame,
+            text="ETF 成分股",
+            value="component",
+            variable=self.data_type_var,
+            command=self._sync_collection_panel,
+        ).pack(side=tk.LEFT)
+
+        scope_frame = ttk.LabelFrame(collection_form, text="共同采集范围", padding=6)
+        scope_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Radiobutton(
+            scope_frame,
+            text="单日",
+            value="single",
+            variable=self.date_mode_var,
+            command=self._sync_collection_panel,
+        ).grid(row=0, column=0, padx=(2, 8), pady=2)
+        ttk.Radiobutton(
+            scope_frame,
+            text="日期区间",
+            value="range",
+            variable=self.date_mode_var,
+            command=self._sync_collection_panel,
+        ).grid(row=0, column=1, padx=(0, 12), pady=2)
+
+        self.date_input_host = ttk.Frame(scope_frame)
+        self.date_input_host.grid(row=0, column=2, sticky="w")
+        self.single_date_frame = ttk.Frame(self.date_input_host)
+        ttk.Label(self.single_date_frame, text="日期").pack(side=tk.LEFT, padx=(0, 4))
+        self.single_date_entry = ttk.Entry(
+            self.single_date_frame, textvariable=self.date_var, width=14
+        )
+        self.single_date_entry.pack(side=tk.LEFT)
+        self.range_date_frame = ttk.Frame(self.date_input_host)
+        ttk.Label(self.range_date_frame, text="开始").pack(side=tk.LEFT, padx=(0, 4))
+        self.start_date_entry = ttk.Entry(
+            self.range_date_frame, textvariable=self.start_var, width=14
+        )
+        self.start_date_entry.pack(side=tk.LEFT)
+        ttk.Label(self.range_date_frame, text="结束").pack(side=tk.LEFT, padx=(10, 4))
+        self.end_date_entry = ttk.Entry(
+            self.range_date_frame, textvariable=self.end_var, width=14
+        )
+        self.end_date_entry.pack(side=tk.LEFT)
+        self.single_date_frame.grid(row=0, column=0, sticky="w")
+        self.range_date_frame.grid(row=0, column=0, sticky="w")
+
+        ttk.Label(scope_frame, text="交易所").grid(row=0, column=3, padx=(18, 4))
+        self.exchange_combo = ttk.Combobox(
+            scope_frame,
             textvariable=self.exchange_var,
             values=("上交所", "深交所", "沪深两市"),
             state="readonly",
             width=10,
-        ).grid(row=0, column=4, padx=4)
+        )
+        self.exchange_combo.grid(row=0, column=4, padx=4)
+        self.exchange_combo.bind(
+            "<<ComboboxSelected>>", lambda _event: self._sync_collection_panel()
+        )
 
-        ttk.Label(form, text="区间").grid(row=1, column=0, padx=4, pady=4)
-        self.start_var = tk.StringVar(value=last_month)
-        self.end_var = tk.StringVar(value=today)
-        ttk.Entry(form, textvariable=self.start_var, width=14).grid(row=1, column=1, padx=4)
-        ttk.Entry(form, textvariable=self.end_var, width=14).grid(row=1, column=2, padx=4)
-        ttk.Label(form, text="线程").grid(row=1, column=3, padx=4)
-        self.workers_var = tk.StringVar(value="16")
-        ttk.Entry(form, textvariable=self.workers_var, width=6).grid(row=1, column=4, padx=4)
-        ttk.Button(form, text="多线程采集区间", command=self.fetch_range).grid(row=1, column=5, padx=4)
+        parameter_host = ttk.LabelFrame(collection_form, text="采集参数", padding=6)
+        parameter_host.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        parameter_host.columnconfigure(0, weight=1)
+        parameter_host.rowconfigure(0, minsize=34)
 
-        pcf_form = ttk.LabelFrame(frame, text="ETF成分股（PCF）", padding=10)
-        pcf_form.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(pcf_form, text="基金代码").grid(row=0, column=0, padx=4, pady=4)
-        ttk.Entry(pcf_form, textvariable=self.pcf_code_var, width=14).grid(row=0, column=1, padx=4)
-        ttk.Button(pcf_form, text="采集当前 PCF", command=self.fetch_pcf_single).grid(row=0, column=2, padx=4)
-        ttk.Button(pcf_form, text="批量采集上交所当前 PCF", command=self.fetch_pcf_batch).grid(row=0, column=3, padx=4)
-        ttk.Button(
-            pcf_form,
-            text="采集深交所当前 PCF",
-            command=self.fetch_szse_pcf_current,
-        ).grid(row=1, column=0, columnspan=2, padx=4, pady=4, sticky="w")
-        ttk.Button(
-            pcf_form,
-            text="采集深交所历史 PCF",
-            command=self.fetch_szse_pcf_history,
-        ).grid(row=1, column=2, padx=4, pady=4)
-        ttk.Checkbutton(
-            pcf_form,
+        self.workers_frame = ttk.Frame(parameter_host)
+        ttk.Label(self.workers_frame, text="并发线程").pack(side=tk.LEFT, padx=(2, 4))
+        self.workers_entry = ttk.Entry(
+            self.workers_frame, textvariable=self.workers_var, width=7
+        )
+        self.workers_entry.pack(side=tk.LEFT)
+        ttk.Label(self.workers_frame, text="深交所份额下载由浏览器自动分批").pack(
+            side=tk.LEFT, padx=12
+        )
+        self.workers_frame.grid(row=0, column=0, sticky="w")
+
+        self.pcf_options_frame = ttk.Frame(parameter_host)
+        ttk.Label(self.pcf_options_frame, text="基金代码（留空为全部）").pack(
+            side=tk.LEFT, padx=(2, 4)
+        )
+        self.pcf_code_entry = ttk.Entry(
+            self.pcf_options_frame, textvariable=self.pcf_code_var, width=14
+        )
+        self.pcf_code_entry.pack(side=tk.LEFT)
+        self.pcf_replace_check = ttk.Checkbutton(
+            self.pcf_options_frame,
             text="重新采集已有快照",
             variable=self.pcf_replace_var,
-        ).grid(row=1, column=3, padx=4, pady=4, sticky="w")
+        )
+        self.pcf_replace_check.pack(side=tk.LEFT, padx=14)
+        self.pcf_options_frame.grid(row=0, column=0, sticky="w")
+
+        action_frame = ttk.Frame(collection_form)
+        action_frame.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        action_frame.columnconfigure(0, weight=1)
+        ttk.Label(
+            action_frame,
+            textvariable=self.collection_notice_var,
+            foreground="#8a5a00",
+        ).grid(row=0, column=0, sticky="w")
+        self.start_collection_button = ttk.Button(
+            action_frame,
+            text="开始采集份额",
+            command=self.start_selected_collection,
+        )
+        self.start_collection_button.grid(row=0, column=1, sticky="e", padx=(12, 0))
+
+        coverage_frame = ttk.LabelFrame(
+            collection_form, text="数据库覆盖范围", padding=6
+        )
+        coverage_frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        self.coverage_placeholder_var = tk.StringVar(value="正在读取数据库统计...")
+        ttk.Label(coverage_frame, textvariable=self.coverage_placeholder_var).pack(
+            anchor="w"
+        )
 
         web_form = ttk.LabelFrame(frame, text="网页", padding=10)
         web_form.pack(fill=tk.X, pady=(0, 10))
@@ -212,6 +321,39 @@ class ETFApp:
         log_scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
         log_scrollbar.grid(row=0, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=log_scrollbar.set)
+
+        self.task_input_widgets = [
+            self.single_date_entry,
+            self.start_date_entry,
+            self.end_date_entry,
+            self.exchange_combo,
+            self.workers_entry,
+            self.pcf_code_entry,
+            self.pcf_replace_check,
+            self.start_collection_button,
+        ]
+        self._sync_collection_panel()
+
+    def _sync_collection_panel(self):
+        state = collection_panel_state(
+            self.data_type_var.get(),
+            self.date_mode_var.get(),
+            self.exchange_var.get(),
+        )
+        if state["show_single_date"]:
+            self.range_date_frame.grid_remove()
+            self.single_date_frame.grid()
+        else:
+            self.single_date_frame.grid_remove()
+            self.range_date_frame.grid()
+        if state["show_workers"]:
+            self.pcf_options_frame.grid_remove()
+            self.workers_frame.grid()
+        else:
+            self.workers_frame.grid_remove()
+            self.pcf_options_frame.grid()
+        self.start_collection_button.configure(text=state["button_text"])
+        self.collection_notice_var.set(state["notice"])
 
     def log(self, text):
         self.root.after(0, lambda: self._append_log(text))
@@ -292,38 +434,113 @@ class ETFApp:
 
         self._run(task)
 
-    def fetch_pcf_single(self):
-        code = self.pcf_code_var.get().strip()
-        if not code.isdigit() or len(code) != 6:
-            messagebox.showerror("基金代码错误", "请输入 6 位数字基金代码。")
-            return
-        self._run(lambda: self._fetch_one_pcf(code))
+    def start_selected_collection(self):
+        if self.data_type_var.get() == "component":
+            self.fetch_selected_components()
+        elif self.date_mode_var.get() == "single":
+            self.fetch_single()
+        else:
+            self.fetch_range()
 
-    def _fetch_one_pcf(self, code):
-        self.log(f"正在采集上交所 {code} 当前 PCF...")
-        info, items = fetch_sse_pcf_for_fund(code)
-        info_count, item_count = self.db.upsert_pcf([info], items)
-        self.log(
-            f"上交所 {code} PCF 完成：公告日 {info.get('内容日期') or '-'}，"
-            f"信息 {info_count} 行，成分 {item_count} 行。"
+    def _pcf_code_or_none(self):
+        code = self.pcf_code_var.get().strip()
+        if code and not (len(code) == 6 and code.isascii() and code.isdigit()):
+            messagebox.showerror("基金代码错误", "基金代码可留空；填写时请输入 6 位数字。")
+            return None
+        return code
+
+    def _szse_pcf_code_or_none(self):
+        return self._pcf_code_or_none()
+
+    def fetch_selected_components(self):
+        date_mode = self.date_mode_var.get()
+        single_date = self.date_var.get().strip()
+        start_date = self.start_var.get().strip()
+        end_date = self.end_var.get().strip()
+        try:
+            if date_mode == "single":
+                self._validate_date(single_date)
+            else:
+                self._validate_date(start_date)
+                self._validate_date(end_date)
+        except ValueError:
+            messagebox.showerror("日期错误", "请输入 YYYY-MM-DD 格式的日期。")
+            return
+        if date_mode == "range" and start_date > end_date:
+            messagebox.showerror("日期错误", "开始日期不能晚于结束日期。")
+            return
+
+        code = self._pcf_code_or_none()
+        if code is None:
+            return
+        replace_existing = bool(self.pcf_replace_var.get())
+        if replace_existing and not messagebox.askyesno(
+            "确认重新采集",
+            "已有成分股快照将按基金和日期整体替换，是否继续？",
+        ):
+            return
+
+        exchanges = tuple(self._selected_exchanges())
+        self.paused_pcf_task = None
+        self._run(
+            lambda: self._fetch_selected_components(
+                exchanges,
+                date_mode,
+                single_date,
+                start_date,
+                end_date,
+                code,
+                replace_existing,
+            )
         )
 
-    def fetch_pcf_batch(self):
-        self._run(self._fetch_pcf_batch)
+    def _fetch_selected_components(
+        self,
+        exchanges,
+        date_mode,
+        single_date,
+        start_date,
+        end_date,
+        code,
+        replace_existing,
+    ):
+        for exchange in exchanges:
+            if exchange == "SSE":
+                self._fetch_sse_components(code, replace_existing)
+            elif date_mode == "single":
+                self._fetch_szse_pcf_current(
+                    code,
+                    replace_existing,
+                    current_date=single_date,
+                    fallback_pending=False,
+                )
+            else:
+                self._fetch_szse_pcf_history(
+                    start_date, end_date, code, replace_existing
+                )
+            if self.paused_pcf_task:
+                break
 
-    def _fetch_pcf_batch(self):
-        funds = self.db.list_fund_codes("SSE")
+    def _fetch_sse_components(self, code, replace_existing):
+        funds = (
+            [{"fund_code": code, "fund_name": ""}]
+            if code
+            else self.db.list_fund_codes("SSE")
+        )
         if not funds:
-            self.log("上交所 PCF 批量采集结束：ETF 表中没有上交所基金代码。")
+            self.log("上交所成分股采集结束：ETF 表中没有上交所基金代码。")
             return
 
         configured_workers = normalize_worker_count(self.workers_var.get())
         workers = min(configured_workers, 4)
         self.log(
-            f"开始批量采集上交所当前 PCF：{len(funds)} 只基金，线程 {workers}，"
+            f"开始采集上交所最新成分股：{len(funds)} 只基金，线程 {workers}，"
             "请求间隔 0.35 秒。"
         )
         completed = 0
+        skipped = 0
+        succeeded = 0
+        failed = 0
         written_info = 0
         written_items = 0
         with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -335,31 +552,35 @@ class ETFApp:
                 code = futures[future]
                 try:
                     info, items = future.result()
-                    info_count, item_count = self.db.upsert_pcf([info], items)
+                    content_date = info.get("内容日期")
+                    fund_code = info.get("基金代码") or code
+                    if (
+                        not replace_existing
+                        and self.db.pcf_is_complete("SSE", fund_code, content_date)
+                    ):
+                        skipped += 1
+                        info_count = item_count = 0
+                    else:
+                        info_count, item_count = self.db.replace_pcf_snapshot(
+                            info, items, source="sse_pcf"
+                        )
+                        succeeded += 1
                     written_info += info_count
                     written_items += item_count
                     completed += 1
                     if completed == 1 or completed % 20 == 0 or completed == len(funds):
-                        self.log(f"PCF 批量进度 {completed}/{len(funds)}，最近完成 {code}。")
+                        self.log(
+                            f"上交所成分股进度 {completed}/{len(funds)}，最近处理 {code}。"
+                        )
                 except Exception as exc:
                     completed += 1
-                    self.log(f"PCF {code} 采集失败，已跳过：{exc}")
-        self.log(f"上交所 PCF 批量采集完成：信息 {written_info} 行，成分 {written_items} 行。")
-
-    def _szse_pcf_code_or_none(self):
-        code = self.pcf_code_var.get().strip()
-        if code and not (len(code) == 6 and code.isascii() and code.isdigit()):
-            messagebox.showerror("基金代码错误", "基金代码可留空；填写时请输入 6 位数字。")
-            return None
-        return code
-
-    def fetch_szse_pcf_current(self):
-        code = self._szse_pcf_code_or_none()
-        if code is None:
-            return
-        replace_existing = self.pcf_replace_var.get()
-        self.paused_pcf_task = None
-        self._run(lambda: self._fetch_szse_pcf_current(code, replace_existing))
+                    failed += 1
+                    self.log(f"上交所成分股 {code} 采集失败，已跳过：{exc}")
+        self.log(
+            f"上交所成分股采集完成：请求 {len(funds)} 只，成功 {succeeded} 只，"
+            f"跳过完整快照 {skipped} 只，失败 {failed} 只；"
+            f"信息 {written_info} 行，成分 {written_items} 行。"
+        )
 
     def _fetch_szse_pcf_current(
         self, code, replace_existing, current_date=None, fallback_pending=True
@@ -386,18 +607,6 @@ class ETFApp:
                 fallback_pending=False,
             )
         return summary
-
-    def fetch_szse_pcf_history(self):
-        start = self.start_var.get().strip()
-        end = self.end_var.get().strip()
-        self._validate_date(start)
-        self._validate_date(end)
-        code = self._szse_pcf_code_or_none()
-        if code is None:
-            return
-        replace_existing = self.pcf_replace_var.get()
-        self.paused_pcf_task = None
-        self._run(lambda: self._fetch_szse_pcf_history(start, end, code, replace_existing))
 
     def _fetch_szse_pcf_history(self, start, end, code, replace_existing):
         dates = self.db.list_stock_trading_dates(start, end)
