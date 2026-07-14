@@ -25,6 +25,11 @@ from szse_download_fetcher import (
     fetch_szse_rows_via_browser_downloads,
 )
 from sse_pcf_fetcher import fetch_sse_pcf_for_fund
+from szse_pcf_fetcher import (
+    SZSEPCFPageError,
+    check_szse_pcf_connection,
+    collect_szse_pcf_via_browser,
+)
 from etf_web_app import ETFWebServer
 from etf_web_app import parse_web_endpoint
 
@@ -117,8 +122,10 @@ class ETFApp:
         self.web_port_var = tk.StringVar(value="1234")
         self.exchange_var = tk.StringVar(value="上交所")
         self.pcf_code_var = tk.StringVar()
+        self.pcf_replace_var = tk.BooleanVar(value=False)
         self.busy = False
         self.paused_task = None
+        self.paused_pcf_task = None
         self._build_ui()
         self._refresh_stats()
 
@@ -158,12 +165,27 @@ class ETFApp:
         ttk.Entry(form, textvariable=self.workers_var, width=6).grid(row=1, column=4, padx=4)
         ttk.Button(form, text="多线程采集区间", command=self.fetch_range).grid(row=1, column=5, padx=4)
 
-        pcf_form = ttk.LabelFrame(frame, text="上交所 ETF 成分股（当前公告日）", padding=10)
+        pcf_form = ttk.LabelFrame(frame, text="ETF成分股（PCF）", padding=10)
         pcf_form.pack(fill=tk.X, pady=(0, 10))
         ttk.Label(pcf_form, text="基金代码").grid(row=0, column=0, padx=4, pady=4)
         ttk.Entry(pcf_form, textvariable=self.pcf_code_var, width=14).grid(row=0, column=1, padx=4)
         ttk.Button(pcf_form, text="采集当前 PCF", command=self.fetch_pcf_single).grid(row=0, column=2, padx=4)
         ttk.Button(pcf_form, text="批量采集上交所当前 PCF", command=self.fetch_pcf_batch).grid(row=0, column=3, padx=4)
+        ttk.Button(
+            pcf_form,
+            text="采集深交所当前 PCF",
+            command=self.fetch_szse_pcf_current,
+        ).grid(row=1, column=0, columnspan=2, padx=4, pady=4, sticky="w")
+        ttk.Button(
+            pcf_form,
+            text="采集深交所历史 PCF",
+            command=self.fetch_szse_pcf_history,
+        ).grid(row=1, column=2, padx=4, pady=4)
+        ttk.Checkbutton(
+            pcf_form,
+            text="重新采集已有快照",
+            variable=self.pcf_replace_var,
+        ).grid(row=1, column=3, padx=4, pady=4, sticky="w")
 
         web_form = ttk.LabelFrame(frame, text="网页", padding=10)
         web_form.pack(fill=tk.X, pady=(0, 10))
@@ -324,6 +346,76 @@ class ETFApp:
                     self.log(f"PCF {code} 采集失败，已跳过：{exc}")
         self.log(f"上交所 PCF 批量采集完成：信息 {written_info} 行，成分 {written_items} 行。")
 
+    def _szse_pcf_code_or_none(self):
+        code = self.pcf_code_var.get().strip()
+        if code and (not code.isdigit() or len(code) != 6):
+            messagebox.showerror("基金代码错误", "基金代码可留空；填写时请输入 6 位数字。")
+            return None
+        return code
+
+    def fetch_szse_pcf_current(self):
+        code = self._szse_pcf_code_or_none()
+        if code is None:
+            return
+        replace_existing = self.pcf_replace_var.get()
+        self.paused_pcf_task = None
+        self._run(lambda: self._fetch_szse_pcf_current(code, replace_existing))
+
+    def _fetch_szse_pcf_current(self, code, replace_existing):
+        today = datetime.now().strftime("%Y-%m-%d")
+        summary = self._fetch_szse_pcf_dates([today], code, replace_existing)
+        if summary is None or summary["discovered"] != 0:
+            return summary
+
+        latest_date = self.db.latest_stock_trading_date(today)
+        if latest_date and latest_date != today:
+            self.log(f"深交所当前 PCF 当日未发现文件，改采最近股票交易日 {latest_date}。")
+            return self._fetch_szse_pcf_dates([latest_date], code, replace_existing)
+        return summary
+
+    def fetch_szse_pcf_history(self):
+        start = self.start_var.get().strip()
+        end = self.end_var.get().strip()
+        self._validate_date(start)
+        self._validate_date(end)
+        code = self._szse_pcf_code_or_none()
+        if code is None:
+            return
+        replace_existing = self.pcf_replace_var.get()
+        self.paused_pcf_task = None
+        self._run(lambda: self._fetch_szse_pcf_history(start, end, code, replace_existing))
+
+    def _fetch_szse_pcf_history(self, start, end, code, replace_existing):
+        dates = self.db.list_stock_trading_dates(start, end)
+        if not dates:
+            self.log("深交所历史 PCF 未找到股票交易日，未开始采集。")
+            return None
+        return self._fetch_szse_pcf_dates(dates, code, replace_existing)
+
+    def _fetch_szse_pcf_dates(self, dates, code, replace_existing):
+        try:
+            return collect_szse_pcf_via_browser(
+                dates,
+                fund_code=code,
+                replace_existing=replace_existing,
+                is_complete=lambda fund, date: self.db.pcf_is_complete("SZSE", fund, date),
+                save_snapshot=lambda info, items: self.db.replace_pcf_snapshot(
+                    info, items, source="szse_pcf_browser"
+                ),
+                on_progress=self.log,
+                visible=False,
+            )
+        except SZSEPCFPageError as exc:
+            self.paused_pcf_task = {
+                "current": exc.trade_date,
+                "end": dates[-1],
+                "code": code,
+                "replace": replace_existing,
+            }
+            self.log(f"深交所 PCF {exc.trade_date} 页面查询失败，已暂停且不会跳过该日期: {exc}")
+            self.log("请先点“测试连通性/继续采集”；测通后会从暂停日期继续。")
+            return None
+
     def _fetch_range_threaded(self, start, end, workers):
         dates = list(iter_weekdays(start, end))
         if not dates:
@@ -463,6 +555,22 @@ class ETFApp:
         self._run(self._test_connection_and_resume)
 
     def _test_connection_and_resume(self):
+        if self.paused_pcf_task:
+            task = self.paused_pcf_task
+            current = task["current"]
+            ok, message = check_szse_pcf_connection(current)
+            self.log(message)
+            if not ok:
+                return
+            dates = self.db.list_stock_trading_dates(current, task["end"])
+            self.paused_pcf_task = None
+            if not dates:
+                self.log("深交所 PCF 暂停区间未找到股票交易日，无法继续采集。")
+                return
+            self.log(f"继续采集深交所 PCF: {dates[0]} ~ {dates[-1]}。")
+            self._fetch_szse_pcf_dates(dates, task["code"], task["replace"])
+            return
+
         if self.paused_task and len(self.paused_task) == 4:
             test_date = self.paused_task[2]
         else:
