@@ -772,6 +772,46 @@ class SZSEPCFCollectorTests(unittest.TestCase):
 
                 self.assertEqual(caught.exception.trade_date, "2026-07-14")
 
+    def test_second_date_save_failure_propagates_and_cleanup_cannot_mask_it(self):
+        reference = SZSEPCFReference(
+            "159915", "2026-07-14", "https://example.test/159915"
+        )
+
+        class FailingExitSession(self.FakeSession):
+            def __exit__(self, exc_type, exc, traceback):
+                self.closed = True
+                raise RuntimeError("session cleanup failed")
+
+        session = FailingExitSession([reference], {"159915": self.xml})
+        database_error = sqlite3.DatabaseError("snapshot insert failed")
+        save_calls = []
+        sleeps = []
+
+        def save_snapshot(info, items):
+            save_calls.append((info, items))
+            if len(save_calls) >= 2:
+                raise database_error
+
+        with self.assertRaises(sqlite3.DatabaseError) as caught:
+            collect_szse_pcf_via_browser(
+                ["2026-07-14", "2026-07-15"],
+                is_complete=lambda code, date: False,
+                save_snapshot=save_snapshot,
+                session_factory=lambda visible=False: session,
+                sleep_func=sleeps.append,
+                delay_func=lambda: 0.8,
+            )
+
+        self.assertIs(caught.exception, database_error)
+        self.assertNotIsInstance(caught.exception, SZSEPCFPageError)
+        self.assertEqual(
+            session.queries,
+            [("2026-07-14", ""), ("2026-07-15", "")],
+        )
+        self.assertEqual(len(save_calls), 2)
+        self.assertEqual(sleeps, [0.8, 0.8])
+        self.assertTrue(session.closed)
+
     def test_converts_global_browser_network_failures_to_page_error(self):
         reference = SZSEPCFReference("159915", "2026-07-14", "https://example.test/159915")
         for marker in (

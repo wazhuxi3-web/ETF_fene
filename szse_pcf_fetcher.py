@@ -326,12 +326,23 @@ def _validate_szse_snapshot(reference: SZSEPCFReference, info: dict, items: list
 def _open_szse_pcf_session(session_factory, visible: bool, first_pending_trade_date: str):
     try:
         session_manager = session_factory(visible=visible)
-        with session_manager as session:
-            yield session
+        session = session_manager.__enter__()
     except SZSEPCFPageError:
         raise
     except Exception as exc:
         raise SZSEPCFPageError(first_pending_trade_date, str(exc)) from exc
+
+    try:
+        yield session
+    except BaseException as body_error:
+        body_traceback = body_error.__traceback__
+        try:
+            session_manager.__exit__(type(body_error), body_error, body_traceback)
+        except BaseException:
+            pass
+        raise body_error.with_traceback(body_traceback)
+    else:
+        session_manager.__exit__(None, None, None)
 
 
 def collect_szse_pcf_via_browser(
@@ -402,12 +413,6 @@ def collect_szse_pcf_via_browser(
                                 session.read_file(reference)
                             )
                             _validate_szse_snapshot(reference, info, items)
-                            save_snapshot(info, items)
-                            summary["succeeded"] += 1
-                            summary["items"] += len(items)
-                            summary["mismatched_amounts"] += mismatches
-                            date_succeeded += 1
-                            date_items += len(items)
                             break
                         except SZSEPCFPageError:
                             raise
@@ -430,6 +435,14 @@ def collect_szse_pcf_via_browser(
                             on_progress(
                                 f"深交所 PCF {trade_date} {reference.fund_code} 下载失败: {last_error}"
                             )
+                        continue
+
+                    save_snapshot(info, items)
+                    summary["succeeded"] += 1
+                    summary["items"] += len(items)
+                    summary["mismatched_amounts"] += mismatches
+                    date_succeeded += 1
+                    date_items += len(items)
                 finally:
                     sleep_func(delay_func())
 
