@@ -285,7 +285,7 @@ def extract_szse_pcf_references(payload: list[dict]) -> list[SZSEPCFReference]:
             for key, child in value.items():
                 if key == "jjdm" and isinstance(child, str):
                     for href in re.findall(
-                        r"href\s*=\s*['\"]([^'\"]*eft_download_new\.html[^'\"]*)",
+                        r"href\s*=\s*['\"]?([^'\"\s>]*eft_download_new\.html[^'\"\s>]*)",
                         child,
                         flags=re.IGNORECASE,
                     ):
@@ -542,7 +542,6 @@ class SZSEPCFBrowserSession:
                     reference.download_url, wait_until="networkidle", timeout=60000
                 )
             final_response = final_response_info.value
-            download_page.wait_for_url("**/files/text/ETFDown/**", timeout=30000)
             return final_response.body()
         except SZSEPCFPageError as exc:
             operation_error = exc

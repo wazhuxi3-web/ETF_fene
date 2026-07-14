@@ -413,6 +413,22 @@ EnDeNdEnD
         )
         self.assertIn("eft_download_new.html", refs[0].download_url)
 
+    def test_extracts_unquoted_download_href_from_live_report_format(self):
+        payload = [{"data": [{"jjdm": (
+            "<a style='cursor:pointer'"
+            "href=/modules/report/views/eft_download_new.html?"
+            "path=%2Ffiles%2Ftext%2FETFDown%2F&"
+            "filename=pcf_159915_20260710%3B159915ETF20260710&"
+            "opencode=ETF15991520260710.txt target='_blank'>下载</a>"
+        )}]}]
+
+        refs = extract_szse_pcf_references(payload)
+
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0].fund_code, "159915")
+        self.assertEqual(refs[0].content_date, "2026-07-10")
+        self.assertIn("eft_download_new.html", refs[0].download_url)
+
 
 class SZSEPCFCollectorTests(unittest.TestCase):
     xml = b"""<PCFFile>
@@ -755,7 +771,7 @@ class SZSEPCFCollectorTests(unittest.TestCase):
 
         self.assertEqual(chromium.launch_calls, [{"headless": False, "slow_mo": 120}])
 
-    def test_read_file_waits_for_and_returns_the_final_file_response(self):
+    def test_read_file_returns_final_response_without_wrapper_navigation(self):
         wrapper = self.FakeResponse(
             "https://www.szse.cn/modules/report/views/eft_download_new.html",
             body=b"wrapper",
@@ -781,7 +797,7 @@ class SZSEPCFCollectorTests(unittest.TestCase):
                 return wrapper
 
             def wait_for_url(page_self, url, timeout):
-                return None
+                raise AssertionError("download wrapper stays on its own URL")
 
             def close(page_self):
                 page_self.closed = True
@@ -941,7 +957,7 @@ class SZSEPCFCollectorTests(unittest.TestCase):
             "159915", "2026-07-14", "https://example.test/download"
         )
 
-        for failure_stage in ("goto", "wait_for_url"):
+        for failure_stage in ("goto",):
             with self.subTest(failure_stage=failure_stage):
                 class DownloadPage:
                     def expect_response(self, predicate, timeout):
