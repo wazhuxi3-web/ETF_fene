@@ -332,6 +332,8 @@ def collect_szse_pcf_via_browser(
         for trade_date in trade_dates:
             try:
                 references = session.query(trade_date, fund_code)
+            except SZSEPCFPageError:
+                raise
             except Exception as exc:
                 raise SZSEPCFPageError(trade_date, str(exc)) from exc
 
@@ -356,6 +358,8 @@ def collect_szse_pcf_via_browser(
                         summary["mismatched_amounts"] += mismatches
                         sleep_func(delay_func())
                         break
+                    except SZSEPCFPageError:
+                        raise
                     except Exception as exc:
                         last_error = exc
                         if backoff is not None:
@@ -383,6 +387,22 @@ SZSE_PCF_PAGE_URL = "https://www.szse.cn/disclosure/fund/currency/index.html"
 SZSE_PCF_REPORT_URL = "https://www.szse.cn/api/report/ShowReport/data?CATALOGID=sgshqd"
 
 
+def _is_browser_session_fatal(exc: Exception) -> bool:
+    if type(exc).__name__ == "TargetClosedError":
+        return True
+    message = str(exc).casefold()
+    return any(
+        marker in message
+        for marker in (
+            "target page, context or browser has been closed",
+            "browser has been closed",
+            "browser closed",
+            "context has been closed",
+            "context closed",
+        )
+    )
+
+
 class SZSEPCFBrowserSession:
     """Browser-backed session for the SZSE PCF report and file redirects."""
 
@@ -403,7 +423,6 @@ class SZSEPCFBrowserSession:
         try:
             self._playwright_context = sync_playwright()
             self.playwright = self._playwright_context.__enter__()
-            # The default deliberately stays headless: playwright.chromium.launch(headless=not visible)
             self.browser = self.playwright.chromium.launch(
                 headless=not self.visible, slow_mo=120
             )
@@ -411,26 +430,37 @@ class SZSEPCFBrowserSession:
             self.page = self.context.new_page()
             self.page.goto(SZSE_PCF_PAGE_URL, wait_until="networkidle", timeout=60000)
             return self
-        except Exception:
-            self.__exit__(None, None, None)
+        except Exception as exc:
+            self.__exit__(type(exc), exc, exc.__traceback__)
             raise
 
     def __exit__(self, exc_type, exc, traceback):
+        cleanup_error = None
         try:
             if self.context is not None:
-                self.context.close()
-        finally:
-            try:
-                if self.browser is not None:
+                try:
+                    self.context.close()
+                except Exception as close_exc:
+                    cleanup_error = close_exc
+            if self.browser is not None:
+                try:
                     self.browser.close()
-            finally:
-                if self._playwright_context is not None:
+                except Exception as close_exc:
+                    cleanup_error = cleanup_error or close_exc
+            if self._playwright_context is not None:
+                try:
                     self._playwright_context.__exit__(exc_type, exc, traceback)
-        self.page = None
-        self.context = None
-        self.browser = None
-        self.playwright = None
-        self._playwright_context = None
+                except Exception as close_exc:
+                    cleanup_error = cleanup_error or close_exc
+        finally:
+            self.page = None
+            self.context = None
+            self.browser = None
+            self.playwright = None
+            self._playwright_context = None
+        if exc_type is None and cleanup_error is not None:
+            raise cleanup_error
+        return False
 
     @staticmethod
     def _report_payloads(first_payload, first_url: str, page_count: int, page) -> list[dict]:
@@ -500,17 +530,33 @@ class SZSEPCFBrowserSession:
         if self.context is None:
             raise RuntimeError("深交所 PCF 浏览器会话尚未打开")
 
-        download_page = self.context.new_page()
+        download_page = None
         try:
-            response = download_page.goto(
-                reference.download_url, wait_until="networkidle", timeout=60000
-            )
+            download_page = self.context.new_page()
+            with download_page.expect_response(
+                lambda response: "/files/text/ETFDown/" in urlsplit(response.url).path,
+                timeout=60000,
+            ) as final_response_info:
+                download_page.goto(
+                    reference.download_url, wait_until="networkidle", timeout=60000
+                )
+            final_response = final_response_info.value
             download_page.wait_for_url("**/files/text/ETFDown/**", timeout=30000)
-            if response is None:
-                raise RuntimeError("深交所 PCF 下载未返回文件响应")
-            return response.body()
+            return final_response.body()
+        except SZSEPCFPageError:
+            raise
+        except Exception as exc:
+            if _is_browser_session_fatal(exc):
+                raise SZSEPCFPageError(reference.content_date, str(exc)) from exc
+            raise
         finally:
-            download_page.close()
+            if download_page is not None:
+                try:
+                    download_page.close()
+                except Exception as exc:
+                    if _is_browser_session_fatal(exc):
+                        raise SZSEPCFPageError(reference.content_date, str(exc)) from exc
+                    raise
 
 
 def check_szse_pcf_connection(

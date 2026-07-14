@@ -40,6 +40,7 @@ from sse_pcf_fetcher import (
     fetch_sse_pcf_for_fund,
 )
 from szse_pcf_fetcher import (
+    SZSEPCFBrowserSession,
     SZSEPCFReference,
     SZSEPCFPageError,
     check_szse_pcf_connection,
@@ -447,6 +448,114 @@ class SZSEPCFCollectorTests(unittest.TestCase):
                 raise value
             return value
 
+    class FakeResponse:
+        def __init__(self, url, *, payload=None, body=b""):
+            self.url = url
+            self.payload = payload
+            self.body_bytes = body
+
+        def json(self):
+            return self.payload
+
+        def body(self):
+            return self.body_bytes
+
+    class FakeExpectation:
+        def __init__(self, response, page=None):
+            self.value = response
+            self.page = page
+
+        def __enter__(self):
+            if self.page is not None:
+                self.page.expectation_active = True
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            if self.page is not None:
+                self.page.expectation_active = False
+
+    class FakeLocator:
+        def __init__(self, page, selector):
+            self.page = page
+            self.selector = selector
+
+        def fill(self, value):
+            self.page.fills.append((self.selector, value))
+
+        def click(self):
+            self.page.clicks.append(self.selector)
+
+    class FakeQueryPage:
+        def __init__(self, first_response, later_payload):
+            self.first_response = first_response
+            self.later_payload = later_payload
+            self.fills = []
+            self.clicks = []
+            self.goto_calls = []
+            self.evaluate_calls = []
+
+        def goto(self, url, **kwargs):
+            self.goto_calls.append((url, kwargs))
+
+        def locator(self, selector):
+            return SZSEPCFCollectorTests.FakeLocator(self, selector)
+
+        def expect_response(self, predicate, timeout):
+            if not predicate(self.first_response):
+                raise AssertionError("report response filter rejected the report")
+            return SZSEPCFCollectorTests.FakeExpectation(self.first_response)
+
+        def evaluate(self, script, url):
+            self.evaluate_calls.append((script, url))
+            return self.later_payload
+
+    class FakeContext:
+        def __init__(self, pages):
+            self.pages = list(pages)
+            self.new_page_calls = 0
+            self.closed = False
+
+        def new_page(self):
+            self.new_page_calls += 1
+            value = self.pages.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        def close(self):
+            self.closed = True
+
+    class FakeBrowser:
+        def __init__(self, context):
+            self.context = context
+            self.closed = False
+
+        def new_context(self):
+            return self.context
+
+        def close(self):
+            self.closed = True
+
+    class FakeChromium:
+        def __init__(self, browser):
+            self.browser = browser
+            self.launch_calls = []
+
+        def launch(self, **kwargs):
+            self.launch_calls.append(kwargs)
+            return self.browser
+
+    class FakePlaywrightManager:
+        def __init__(self, chromium):
+            self.playwright = type("FakePlaywright", (), {"chromium": chromium})()
+            self.exited = False
+
+        def __enter__(self):
+            return self.playwright
+
+        def __exit__(self, exc_type, exc, traceback):
+            self.exited = True
+
     def test_collects_unfinished_references_through_one_session(self):
         references = [
             SZSEPCFReference("159001", "2026-07-14", "https://example.test/159001"),
@@ -550,15 +659,270 @@ class SZSEPCFCollectorTests(unittest.TestCase):
         self.assertEqual(caught.exception.trade_date, "2026-07-14")
         self.assertTrue(fake_session.closed)
 
-    def test_browser_session_uses_the_official_pcf_page_and_hidden_browser(self):
-        source = Path("szse_pcf_fetcher.py").read_text(encoding="utf-8")
+    def test_rethrows_session_page_error_without_file_retries(self):
+        references = [
+            SZSEPCFReference("159915", "2026-07-14", "https://example.test/159915"),
+            SZSEPCFReference("159001", "2026-07-14", "https://example.test/159001"),
+        ]
+        fake_session = self.FakeSession(
+            references,
+            {
+                "159915": SZSEPCFPageError("2026-07-14", "browser closed"),
+                "159001": self.xml,
+            },
+        )
+        sleeps = []
 
-        self.assertIn("playwright.chromium.launch(headless=not visible)", source)
-        self.assertIn("input.query-txtJCorDH", source)
-        self.assertIn("input.query-txtStart", source)
-        self.assertIn("input.query-txtEnd", source)
-        self.assertIn("button.confirm-query", source)
-        self.assertIn("CATALOGID=sgshqd", source)
+        with self.assertRaisesRegex(SZSEPCFPageError, "browser closed") as caught:
+            collect_szse_pcf_via_browser(
+                ["2026-07-14", "2026-07-15"],
+                is_complete=lambda code, date: False,
+                save_snapshot=lambda info, items: None,
+                session_factory=lambda visible=False: fake_session,
+                sleep_func=lambda seconds: sleeps.append(seconds),
+            )
+
+        self.assertEqual(caught.exception.trade_date, "2026-07-14")
+        self.assertEqual(fake_session.queries, [("2026-07-14", "")])
+        self.assertEqual([ref.fund_code for ref in fake_session.reads], ["159915"])
+        self.assertEqual(sleeps, [])
+        self.assertTrue(fake_session.closed)
+
+    def test_browser_session_launches_and_queries_through_one_context(self):
+        first_payload = [{
+            "metadata": {"pagecount": 2},
+            "data": [{"jjdm": (
+                "<a href='/modules/report/views/eft_download_new.html?"
+                "filename=pcf_159915_20260714'>下载</a>"
+            )}],
+        }]
+        second_payload = [{
+            "metadata": {"pagecount": 2},
+            "data": [{"jjdm": (
+                "<a href='/modules/report/views/eft_download_new.html?"
+                "filename=pcf_159001_20260714'>下载</a>"
+            )}],
+        }]
+        report_response = self.FakeResponse(
+            "https://www.szse.cn/api/report/ShowReport/data?"
+            "CATALOGID=sgshqd&PAGENO=1&tab1PAGENO=1",
+            payload=first_payload,
+        )
+        page = self.FakeQueryPage(report_response, second_payload)
+        context = self.FakeContext([page])
+        browser = self.FakeBrowser(context)
+        chromium = self.FakeChromium(browser)
+        manager = self.FakePlaywrightManager(chromium)
+
+        with patch("playwright.sync_api.sync_playwright", return_value=manager):
+            with SZSEPCFBrowserSession(visible=False) as session:
+                references = session.query("2026-07-14", "159915")
+
+        self.assertEqual(chromium.launch_calls, [{"headless": True, "slow_mo": 120}])
+        self.assertEqual(
+            page.goto_calls[0][0],
+            "https://www.szse.cn/disclosure/fund/currency/index.html",
+        )
+        self.assertEqual(
+            page.fills,
+            [
+                ("input.query-txtJCorDH", "159915"),
+                ("input.query-txtStart", "2026-07-14"),
+                ("input.query-txtEnd", "2026-07-14"),
+            ],
+        )
+        self.assertEqual(page.clicks, ["button.confirm-query"])
+        self.assertEqual([ref.fund_code for ref in references], ["159915", "159001"])
+        self.assertEqual(context.new_page_calls, 1)
+        self.assertEqual(len(page.evaluate_calls), 1)
+        self.assertIn("PAGENO=2", page.evaluate_calls[0][1])
+        self.assertIn("tab1PAGENO=2", page.evaluate_calls[0][1])
+        self.assertTrue(context.closed)
+        self.assertTrue(browser.closed)
+        self.assertTrue(manager.exited)
+
+    def test_browser_session_honors_visible_launch_option(self):
+        page = self.FakeQueryPage(self.FakeResponse("unused"), [])
+        context = self.FakeContext([page])
+        browser = self.FakeBrowser(context)
+        chromium = self.FakeChromium(browser)
+        manager = self.FakePlaywrightManager(chromium)
+
+        with patch("playwright.sync_api.sync_playwright", return_value=manager):
+            with SZSEPCFBrowserSession(visible=True):
+                pass
+
+        self.assertEqual(chromium.launch_calls, [{"headless": False, "slow_mo": 120}])
+
+    def test_read_file_waits_for_and_returns_the_final_file_response(self):
+        wrapper = self.FakeResponse(
+            "https://www.szse.cn/modules/report/views/eft_download_new.html",
+            body=b"wrapper",
+        )
+        final = self.FakeResponse(
+            "https://www.szse.cn/files/text/ETFDown/ETF15991520260714.txt",
+            body=self.xml,
+        )
+
+        class DownloadPage:
+            def __init__(self):
+                self.expectation_active = False
+                self.closed = False
+                self.filter_results = []
+
+            def expect_response(page_self, predicate, timeout):
+                page_self.filter_results = [predicate(wrapper), predicate(final)]
+                return SZSEPCFCollectorTests.FakeExpectation(final, page_self)
+
+            def goto(page_self, url, **kwargs):
+                if not page_self.expectation_active:
+                    raise AssertionError("final-response wait must start before navigation")
+                return wrapper
+
+            def wait_for_url(page_self, url, timeout):
+                return None
+
+            def close(page_self):
+                page_self.closed = True
+
+        download_page = DownloadPage()
+        session = SZSEPCFBrowserSession()
+        session.context = self.FakeContext([download_page])
+        reference = SZSEPCFReference(
+            "159915", "2026-07-14", "https://example.test/download"
+        )
+
+        raw = session.read_file(reference)
+
+        self.assertEqual(raw, self.xml)
+        self.assertEqual(download_page.filter_results, [False, True])
+        self.assertTrue(download_page.closed)
+
+    def test_read_file_converts_closed_context_to_page_error(self):
+        class TargetClosedError(RuntimeError):
+            pass
+
+        session = SZSEPCFBrowserSession()
+        session.context = self.FakeContext([TargetClosedError("context closed")])
+        reference = SZSEPCFReference(
+            "159915", "2026-07-14", "https://example.test/download"
+        )
+
+        with self.assertRaisesRegex(SZSEPCFPageError, "context closed") as caught:
+            session.read_file(reference)
+
+        self.assertEqual(caught.exception.trade_date, "2026-07-14")
+
+    def test_read_file_converts_fatal_page_close_failure_to_page_error(self):
+        final = self.FakeResponse(
+            "https://www.szse.cn/files/text/ETFDown/ETF15991520260714.txt",
+            body=self.xml,
+        )
+
+        class TargetClosedError(RuntimeError):
+            pass
+
+        class DownloadPage:
+            def expect_response(self, predicate, timeout):
+                return SZSEPCFCollectorTests.FakeExpectation(final)
+
+            def goto(self, url, **kwargs):
+                return None
+
+            def wait_for_url(self, url, timeout):
+                return None
+
+            def close(self):
+                raise TargetClosedError("browser closed during page cleanup")
+
+        session = SZSEPCFBrowserSession()
+        session.context = self.FakeContext([DownloadPage()])
+        reference = SZSEPCFReference(
+            "159915", "2026-07-14", "https://example.test/download"
+        )
+
+        with self.assertRaisesRegex(SZSEPCFPageError, "browser closed") as caught:
+            session.read_file(reference)
+
+        self.assertEqual(caught.exception.trade_date, "2026-07-14")
+
+    def test_read_file_closes_download_page_when_body_read_fails(self):
+        class FailingResponse(self.FakeResponse):
+            def body(self):
+                raise ValueError("invalid response body")
+
+        final = FailingResponse(
+            "https://www.szse.cn/files/text/ETFDown/ETF15991520260714.txt"
+        )
+
+        class DownloadPage:
+            def __init__(self):
+                self.closed = False
+
+            def expect_response(self, predicate, timeout):
+                return SZSEPCFCollectorTests.FakeExpectation(final)
+
+            def goto(self, url, **kwargs):
+                return None
+
+            def wait_for_url(self, url, timeout):
+                return None
+
+            def close(self):
+                self.closed = True
+
+        download_page = DownloadPage()
+        session = SZSEPCFBrowserSession()
+        session.context = self.FakeContext([download_page])
+        reference = SZSEPCFReference(
+            "159915", "2026-07-14", "https://example.test/download"
+        )
+
+        with self.assertRaisesRegex(ValueError, "invalid response body"):
+            session.read_file(reference)
+
+        self.assertTrue(download_page.closed)
+
+    def test_browser_session_cleans_up_when_initial_page_load_fails(self):
+        class FailingPage(self.FakeQueryPage):
+            def goto(self, url, **kwargs):
+                raise RuntimeError("page load failed")
+
+        page = FailingPage(self.FakeResponse("unused"), [])
+        context = self.FakeContext([page])
+        browser = self.FakeBrowser(context)
+        chromium = self.FakeChromium(browser)
+        manager = self.FakePlaywrightManager(chromium)
+
+        with patch("playwright.sync_api.sync_playwright", return_value=manager):
+            with self.assertRaisesRegex(RuntimeError, "page load failed"):
+                with SZSEPCFBrowserSession():
+                    pass
+
+        self.assertTrue(context.closed)
+        self.assertTrue(browser.closed)
+        self.assertTrue(manager.exited)
+
+    def test_browser_session_cleanup_does_not_mask_active_page_error(self):
+        class FailingCloseContext(self.FakeContext):
+            def close(self):
+                self.closed = True
+                raise RuntimeError("context cleanup failed")
+
+        page = self.FakeQueryPage(self.FakeResponse("unused"), [])
+        context = FailingCloseContext([page])
+        browser = self.FakeBrowser(context)
+        chromium = self.FakeChromium(browser)
+        manager = self.FakePlaywrightManager(chromium)
+
+        with patch("playwright.sync_api.sync_playwright", return_value=manager):
+            with self.assertRaisesRegex(SZSEPCFPageError, "report failed"):
+                with SZSEPCFBrowserSession():
+                    raise SZSEPCFPageError("2026-07-14", "report failed")
+
+        self.assertTrue(context.closed)
+        self.assertTrue(browser.closed)
+        self.assertTrue(manager.exited)
 
     def test_connection_probe_reads_only_the_first_reference(self):
         references = [
