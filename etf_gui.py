@@ -25,6 +25,11 @@ from szse_download_fetcher import (
     fetch_szse_rows_via_browser_downloads,
 )
 from sse_pcf_fetcher import fetch_sse_pcf_for_fund
+from eastmoney_holding_fetcher import (
+    EastmoneyHoldingError,
+    check_eastmoney_holding_connection,
+    fetch_eastmoney_holdings,
+)
 from szse_pcf_fetcher import (
     SZSEPCFPageError,
     check_szse_pcf_connection,
@@ -113,6 +118,16 @@ def _mark_shutdown() -> None:
 def collection_panel_state(
     data_type: str, date_mode: str, exchange_label: str
 ) -> dict:
+    if data_type == "holding":
+        return {
+            "show_single_date": False,
+            "show_range_dates": False,
+            "show_holding_years": True,
+            "show_workers": True,
+            "show_pcf_options": True,
+            "button_text": "开始采集季度持仓",
+            "notice": "东方财富按年度返回季度报告；一、三季度通常不是完整持仓，回测请按可用日期过滤。",
+        }
     is_component = data_type == "component"
     notice = ""
     if is_component and exchange_label == "上交所":
@@ -138,6 +153,12 @@ def format_coverage_cell(kind: str, stats: dict) -> str:
             f"{stats['rows_count']} 行 / {stats['fund_count']} 只 / "
             f"{stats['date_count']} 日"
         )
+    if kind == "holding":
+        return (
+            f"{stats['min_date']} ~ {stats['max_date']} | "
+            f"{stats['report_count']} 份报告 / {stats['fund_count']} 只 / "
+            f"{stats['item_count']} 条 / 完整 {stats['full_report_count']}"
+        )
     return (
         f"{stats['min_date']} ~ {stats['max_date']} | "
         f"{stats['snapshot_count']} 快照 / {stats['fund_count']} 只 / "
@@ -161,11 +182,13 @@ class ETFApp:
         self.data_type_var = tk.StringVar(value="share")
         self.task_status_var = tk.StringVar(value="空闲")
         self.collection_notice_var = tk.StringVar()
+        self.workers_hint_var = tk.StringVar(value="深交所份额下载由浏览器自动分批")
         self.pcf_code_var = tk.StringVar()
         self.pcf_replace_var = tk.BooleanVar(value=False)
         self.busy = False
         self.paused_task = None
         self.paused_pcf_task = None
+        self.paused_holding_task = None
         self._build_ui()
         self._refresh_stats()
 
@@ -181,6 +204,8 @@ class ETFApp:
         self.date_var = tk.StringVar(value=today)
         self.start_var = tk.StringVar(value=last_month)
         self.end_var = tk.StringVar(value=today)
+        self.holding_start_year_var = tk.StringVar(value="2016")
+        self.holding_end_year_var = tk.StringVar(value=str(datetime.now().year))
         self.workers_var = tk.StringVar(value="16")
 
         collection_form = ttk.LabelFrame(frame, text="ETF 数据采集", padding=10)
@@ -205,6 +230,14 @@ class ETFApp:
             command=self._sync_collection_panel,
         )
         self.component_type_button.pack(side=tk.LEFT)
+        self.holding_type_button = ttk.Radiobutton(
+            content_frame,
+            text="基金季度持仓",
+            value="holding",
+            variable=self.data_type_var,
+            command=self._sync_collection_panel,
+        )
+        self.holding_type_button.pack(side=tk.LEFT, padx=(14, 0))
 
         scope_frame = ttk.LabelFrame(collection_form, text="共同采集范围", padding=6)
         scope_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
@@ -247,6 +280,20 @@ class ETFApp:
         self.single_date_frame.grid(row=0, column=0, sticky="w")
         self.range_date_frame.grid(row=0, column=0, sticky="w")
 
+        self.holding_year_frame = ttk.Frame(scope_frame)
+        ttk.Label(self.holding_year_frame, text="报告年度").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Entry(
+            self.holding_year_frame,
+            textvariable=self.holding_start_year_var,
+            width=7,
+        ).pack(side=tk.LEFT)
+        ttk.Label(self.holding_year_frame, text="至").pack(side=tk.LEFT, padx=6)
+        ttk.Entry(
+            self.holding_year_frame,
+            textvariable=self.holding_end_year_var,
+            width=7,
+        ).pack(side=tk.LEFT)
+
         ttk.Label(scope_frame, text="交易所").grid(row=0, column=3, padx=(18, 4))
         self.exchange_combo = ttk.Combobox(
             scope_frame,
@@ -263,6 +310,7 @@ class ETFApp:
         parameter_host = ttk.LabelFrame(collection_form, text="采集参数", padding=6)
         parameter_host.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         parameter_host.columnconfigure(0, weight=1)
+        parameter_host.columnconfigure(1, weight=1)
         parameter_host.rowconfigure(0, minsize=34)
 
         self.workers_frame = ttk.Frame(parameter_host)
@@ -271,7 +319,7 @@ class ETFApp:
             self.workers_frame, textvariable=self.workers_var, width=7
         )
         self.workers_entry.pack(side=tk.LEFT)
-        ttk.Label(self.workers_frame, text="深交所份额下载由浏览器自动分批").pack(
+        ttk.Label(self.workers_frame, textvariable=self.workers_hint_var).pack(
             side=tk.LEFT, padx=12
         )
         self.workers_frame.grid(row=0, column=0, sticky="w")
@@ -324,11 +372,11 @@ class ETFApp:
         )
         self.coverage_vars = {
             (kind, exchange): tk.StringVar(value="正在读取...")
-            for kind in ("share", "component")
+            for kind in ("share", "component", "holding")
             for exchange in ("SSE", "SZSE")
         }
         for row, (kind, label) in enumerate(
-            (("share", "ETF 份额"), ("component", "ETF 成分股")), start=1
+            (("share", "ETF 份额"), ("component", "ETF 成分股"), ("holding", "基金季度持仓")), start=1
         ):
             ttk.Label(coverage_frame, text=label).grid(
                 row=row, column=0, sticky="w", padx=(0, 10), pady=2
@@ -375,11 +423,13 @@ class ETFApp:
         self.task_input_widgets = [
             self.share_type_button,
             self.component_type_button,
+            self.holding_type_button,
             self.single_mode_button,
             self.range_mode_button,
             self.single_date_entry,
             self.start_date_entry,
             self.end_date_entry,
+            *self.holding_year_frame.winfo_children(),
             self.exchange_combo,
             self.workers_entry,
             self.pcf_code_entry,
@@ -396,20 +446,38 @@ class ETFApp:
             self.date_mode_var.get(),
             self.exchange_var.get(),
         )
-        if state["show_single_date"]:
+        self.holding_year_frame.grid_remove()
+        if state.get("show_holding_years"):
+            self.single_mode_button.grid_remove()
+            self.range_mode_button.grid_remove()
+            self.single_date_frame.grid_remove()
+            self.range_date_frame.grid_remove()
+            self.holding_year_frame.grid(row=0, column=0, sticky="w")
+        elif state["show_single_date"]:
+            self.single_mode_button.grid()
+            self.range_mode_button.grid()
             self.range_date_frame.grid_remove()
             self.single_date_frame.grid()
         else:
+            self.single_mode_button.grid()
+            self.range_mode_button.grid()
             self.single_date_frame.grid_remove()
             self.range_date_frame.grid()
-        if state["show_workers"]:
+        if self.data_type_var.get() == "holding":
+            self.workers_frame.grid(row=0, column=0, sticky="w")
+            self.pcf_options_frame.grid(row=0, column=1, sticky="w", padx=(18, 0))
+        elif state["show_workers"]:
             self.pcf_options_frame.grid_remove()
-            self.workers_frame.grid()
+            self.workers_frame.grid(row=0, column=0, sticky="w")
         else:
             self.workers_frame.grid_remove()
-            self.pcf_options_frame.grid()
+            self.pcf_options_frame.grid(row=0, column=0, sticky="w")
         self.start_collection_button.configure(text=state["button_text"])
         self.collection_notice_var.set(state["notice"])
+        if self.data_type_var.get() == "holding":
+            self.workers_hint_var.set("东方财富请求建议 2~4 线程，按年度返回季度表")
+        else:
+            self.workers_hint_var.set("深交所份额下载由浏览器自动分批")
 
     def log(self, text):
         self.root.after(0, lambda: self._append_log(text))
@@ -447,7 +515,7 @@ class ETFApp:
                 _write_crash_log("background task failed")
                 self.log(f"失败: {exc}")
             finally:
-                status = "已暂停" if self.paused_task or self.paused_pcf_task else "空闲"
+                status = "已暂停" if self.paused_task or self.paused_pcf_task or getattr(self, "paused_holding_task", None) else "空闲"
                 self.root.after(0, lambda: self._finish_background_task(status))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -471,7 +539,7 @@ class ETFApp:
     def _update_continue_button(self):
         state = (
             "normal"
-            if not self.busy and (self.paused_pcf_task or self.paused_task)
+            if not self.busy and (self.paused_pcf_task or getattr(self, "paused_holding_task", None) or self.paused_task)
             else "disabled"
         )
         self.continue_button.configure(state=state)
@@ -515,7 +583,9 @@ class ETFApp:
         self._run(task)
 
     def start_selected_collection(self):
-        if self.data_type_var.get() == "component":
+        if self.data_type_var.get() == "holding":
+            self.fetch_selected_holdings()
+        elif self.data_type_var.get() == "component":
             self.fetch_selected_components()
         elif self.date_mode_var.get() == "single":
             self.fetch_single()
@@ -528,6 +598,139 @@ class ETFApp:
             messagebox.showerror("基金代码错误", "基金代码可留空；填写时请输入 6 位数字。")
             return None
         return code
+
+    def _holding_years_or_none(self):
+        start_text = self.holding_start_year_var.get().strip()
+        end_text = self.holding_end_year_var.get().strip()
+        if not (start_text.isdigit() and end_text.isdigit() and len(start_text) == 4 and len(end_text) == 4):
+            messagebox.showerror("报告年度错误", "请输入 4 位数字的起止年度。")
+            return None
+        start_year, end_year = int(start_text), int(end_text)
+        if start_year < 1990 or end_year > datetime.now().year + 1 or start_year > end_year:
+            messagebox.showerror("报告年度错误", "起止年度无效，且开始年度不能晚于结束年度。")
+            return None
+        return start_year, end_year
+
+    def fetch_selected_holdings(self):
+        years = self._holding_years_or_none()
+        if years is None:
+            return
+        code = self._pcf_code_or_none()
+        if code is None:
+            return
+        replace_existing = bool(self.pcf_replace_var.get())
+        if replace_existing and not messagebox.askyesno(
+            "确认重新采集",
+            "已有基金季度持仓快照将按基金和报告期整体替换，是否继续？",
+        ):
+            return
+        self.paused_holding_task = None
+        exchanges = tuple(self._selected_exchanges())
+        self._run(
+            lambda: self._fetch_selected_holdings(
+                exchanges, years[0], years[1], code, replace_existing
+            )
+        )
+
+    def _holding_tasks(self, exchanges, start_year, end_year, code):
+        tasks = []
+        for exchange in exchanges:
+            if code:
+                funds = [{"fund_code": code, "fund_name": ""}]
+                known_exchanges = self.db.fund_exchanges(code)
+                if known_exchanges and exchange not in known_exchanges:
+                    continue
+            else:
+                funds = self.db.list_fund_codes(exchange)
+            for year in range(start_year, end_year + 1):
+                for fund in funds:
+                    tasks.append((exchange, fund["fund_code"], fund.get("fund_name") or "", year))
+        return tasks
+
+    def _fetch_selected_holdings(self, exchanges, start_year, end_year, code, replace_existing):
+        tasks = self._holding_tasks(exchanges, start_year, end_year, code)
+        if not tasks:
+            self.log("季度持仓采集没有找到符合条件的基金代码。")
+            return
+        workers = min(normalize_worker_count(self.workers_var.get()), 4)
+        self.log(
+            f"开始采集基金季度持仓：{len(tasks)} 个基金年度任务，线程 {workers}；"
+            "东方财富每次年度请求可能返回多个季度。"
+        )
+        completed = 0
+        written_reports = 0
+        written_items = 0
+        skipped_reports = 0
+        completed_tasks = set()
+        executor = ThreadPoolExecutor(max_workers=workers)
+        futures = {
+            executor.submit(
+                fetch_eastmoney_holdings,
+                fund_code,
+                year,
+                exchange=exchange,
+                fund_name=fund_name,
+                include_report_dates=True,
+            ): task
+            for task in tasks
+            for exchange, fund_code, fund_name, year in [task]
+        }
+        try:
+            for future in as_completed(futures):
+                task = futures[future]
+                exchange, fund_code, fund_name, year = task
+                try:
+                    rows = future.result()
+                    grouped = {}
+                    for row in rows:
+                        grouped.setdefault(row["报告期"], []).append(row)
+                    for report_period, snapshot in sorted(grouped.items()):
+                        if not replace_existing and self.db.holding_snapshot_exists(
+                            exchange, fund_code, report_period
+                        ):
+                            skipped_reports += 1
+                            continue
+                        report_count, item_count = self.db.replace_holding_snapshot(
+                            snapshot, source="eastmoney_holding"
+                        )
+                        written_reports += report_count
+                        written_items += item_count
+                    completed += 1
+                    completed_tasks.add(task)
+                    if completed == 1 or completed % 25 == 0 or completed == len(tasks):
+                        self.log(
+                            f"基金季度持仓进度 {completed}/{len(tasks)}，最近处理 {fund_code} {year} 年。"
+                        )
+                except EastmoneyHoldingError as exc:
+                    self.paused_holding_task = {
+                        "tasks": [item for item in tasks if item not in completed_tasks],
+                        "replace": replace_existing,
+                    }
+                    self.log(f"基金季度持仓 {fund_code} {year} 年请求失败，已暂停：{exc}")
+                    self.log("请先点“测试连接”；测通后点“继续暂停任务”，不会跳过失败任务。")
+                    break
+                except Exception as exc:
+                    self.paused_holding_task = {
+                        "tasks": [item for item in tasks if item not in completed_tasks],
+                        "replace": replace_existing,
+                    }
+                    self.log(f"基金季度持仓 {fund_code} {year} 年入库失败，已暂停：{exc}")
+                    break
+        finally:
+            for future in futures:
+                if not future.done():
+                    future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+        if self.paused_holding_task:
+            self.log(
+                f"基金季度持仓已暂停：写入 {written_reports} 份报告、{written_items} 条持仓，"
+                f"跳过已有 {skipped_reports} 份报告。"
+            )
+        else:
+            self.log(
+                f"基金季度持仓采集完成：写入 {written_reports} 份报告、{written_items} 条持仓，"
+                f"跳过已有 {skipped_reports} 份报告。"
+            )
 
     def _szse_pcf_code_or_none(self):
         return self._pcf_code_or_none()
@@ -861,18 +1064,24 @@ class ETFApp:
         return count
 
     def test_selected_connection(self):
-        test_date = (
-            self.date_var.get().strip()
-            if self.date_mode_var.get() == "single"
-            else self.end_var.get().strip()
-        )
-        try:
-            self._validate_date(test_date)
-        except ValueError:
-            messagebox.showerror("日期错误", "请输入 YYYY-MM-DD 格式的日期。")
-            return
+        if self.data_type_var.get() == "holding":
+            years = self._holding_years_or_none()
+            if years is None:
+                return
+            test_date = str(years[1])
+        else:
+            test_date = (
+                self.date_var.get().strip()
+                if self.date_mode_var.get() == "single"
+                else self.end_var.get().strip()
+            )
+            try:
+                self._validate_date(test_date)
+            except ValueError:
+                messagebox.showerror("日期错误", "请输入 YYYY-MM-DD 格式的日期。")
+                return
         code = ""
-        if self.data_type_var.get() == "component":
+        if self.data_type_var.get() in {"component", "holding"}:
             code = self._pcf_code_or_none()
             if code is None:
                 return
@@ -885,6 +1094,19 @@ class ETFApp:
         )
 
     def _test_selected_connection(self, data_type, exchanges, test_date, code):
+        if data_type == "holding":
+            probe_year = int(test_date)
+            for exchange in exchanges:
+                probe_code = code
+                if not probe_code:
+                    funds = self.db.list_fund_codes(exchange)
+                    if not funds:
+                        self.log(f"{exchange} 季度持仓连接测试失败：ETF 表中没有基金代码。")
+                        continue
+                    probe_code = funds[0]["fund_code"]
+                ok, message = check_eastmoney_holding_connection(probe_code, probe_year)
+                self.log(f"{exchange} {message}")
+            return
         for exchange in exchanges:
             if data_type == "share":
                 if exchange == "SZSE":
@@ -916,7 +1138,7 @@ class ETFApp:
                 self.log(f"上交所成分股连接失败：{probe_code}，{exc}")
 
     def continue_paused_task(self):
-        if not self.paused_pcf_task and not self.paused_task:
+        if not self.paused_pcf_task and not getattr(self, "paused_holding_task", None) and not self.paused_task:
             return
         self._run(self._continue_paused_task)
 
@@ -954,6 +1176,22 @@ class ETFApp:
                 self.paused_pcf_task = None
             return
 
+        if getattr(self, "paused_holding_task", None):
+            task = self.paused_holding_task
+            pending = list(task.get("tasks") or [])
+            if not pending:
+                self.log("季度持仓暂停任务没有待采任务，无法继续采集。")
+                return
+            exchange, fund_code, _fund_name, year = pending[0]
+            ok, message = check_eastmoney_holding_connection(fund_code, year)
+            self.log(message)
+            if not ok:
+                return
+            self.log(f"继续采集基金季度持仓：剩余 {len(pending)} 个基金年度任务。")
+            self.paused_holding_task = None
+            self._fetch_holding_tasks(pending, task.get("replace", False))
+            return
+
         if not self.paused_task:
             return
 
@@ -987,6 +1225,64 @@ class ETFApp:
         else:
             self._fetch_range_threaded(current, end, workers)
 
+    def _fetch_holding_tasks(self, tasks, replace_existing):
+        if not tasks:
+            return
+        exchanges = tuple(dict.fromkeys(task[0] for task in tasks))
+        start_year = min(task[3] for task in tasks)
+        end_year = max(task[3] for task in tasks)
+        # 续采使用精确的剩余任务列表，避免根据当前数据库状态重新推导而漏掉失败任务。
+        workers = min(normalize_worker_count(self.workers_var.get()), 4)
+        completed = 0
+        completed_tasks = set()
+        executor = ThreadPoolExecutor(max_workers=workers)
+        futures = {
+            executor.submit(
+                fetch_eastmoney_holdings,
+                fund_code,
+                year,
+                exchange=exchange,
+                fund_name=fund_name,
+                include_report_dates=True,
+            ): task
+            for task in tasks
+            for exchange, fund_code, fund_name, year in [task]
+        }
+        try:
+            for future in as_completed(futures):
+                task = futures[future]
+                exchange, fund_code, _fund_name, year = task
+                try:
+                    rows = future.result()
+                    grouped = {}
+                    for row in rows:
+                        grouped.setdefault(row["报告期"], []).append(row)
+                    for report_period, snapshot in grouped.items():
+                        if not replace_existing and self.db.holding_snapshot_exists(
+                            exchange, fund_code, report_period
+                        ):
+                            continue
+                        self.db.replace_holding_snapshot(snapshot, source="eastmoney_holding")
+                    completed += 1
+                    completed_tasks.add(task)
+                    if completed == 1 or completed % 25 == 0 or completed == len(tasks):
+                        self.log(f"季度持仓续采进度 {completed}/{len(tasks)}，最近处理 {fund_code} {year} 年。")
+                except Exception as exc:
+                    self.paused_holding_task = {
+                        "tasks": [item for item in tasks if item not in completed_tasks],
+                        "replace": replace_existing,
+                    }
+                    self.log(f"季度持仓续采在 {fund_code} {year} 年暂停：{exc}")
+                    self.log("失败任务已保留，不会自动跳过。")
+                    break
+        finally:
+            for future in futures:
+                if not future.done():
+                    future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+        if not self.paused_holding_task:
+            self.log(f"季度持仓续采完成：处理 {completed} 个基金年度任务。")
+
     def open_web(self):
         try:
             host, port = parse_web_endpoint(self.web_host_var.get(), self.web_port_var.get())
@@ -1010,11 +1306,11 @@ class ETFApp:
 
     def _refresh_stats(self):
         coverage = self.db.get_collection_coverage()
-        for kind in ("share", "component"):
+        for kind in ("share", "component", "holding"):
             for exchange in ("SSE", "SZSE"):
-                self.coverage_vars[(kind, exchange)].set(
-                    format_coverage_cell(kind, coverage[kind][exchange])
-                )
+                variable = self.coverage_vars.get((kind, exchange))
+                if variable is not None:
+                    variable.set(format_coverage_cell(kind, coverage[kind][exchange]))
 
     @staticmethod
     def _validate_date(value):

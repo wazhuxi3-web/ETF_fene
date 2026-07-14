@@ -24,6 +24,11 @@ PCF_ITEM_COLUMNS = (
     "申购现金替代溢价比例", "赎回现金替代折价比例", "替代金额", "挂牌市场",
 )
 
+HOLDING_COLUMNS = (
+    "交易所", "基金代码", "基金名称", "报告年度", "报告季度", "报告期", "可用日期",
+    "数据完整性", "序号", "股票代码", "股票名称", "占净值比例", "持股数", "持仓市值", "挂牌市场",
+)
+
 
 class ETFDatabase:
     def __init__(self, db_path: str | Path = DEFAULT_DB_PATH):
@@ -136,6 +141,39 @@ class ETFDatabase:
         )
         conn.execute(
             'CREATE INDEX IF NOT EXISTS idx_etf_item_date ON ETF_ITEM("交易所", "内容日期")'
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ETF_HOLDING (
+                "编号" INTEGER PRIMARY KEY AUTOINCREMENT,
+                "交易所" TEXT NOT NULL DEFAULT 'SSE',
+                "基金代码" TEXT NOT NULL,
+                "基金名称" TEXT,
+                "报告年度" INTEGER NOT NULL,
+                "报告季度" INTEGER NOT NULL,
+                "报告期" TEXT NOT NULL,
+                "可用日期" TEXT,
+                "数据完整性" TEXT,
+                "序号" INTEGER,
+                "股票代码" TEXT NOT NULL,
+                "股票名称" TEXT,
+                "占净值比例" REAL,
+                "持股数" REAL,
+                "持仓市值" REAL,
+                "挂牌市场" TEXT,
+                "来源" TEXT NOT NULL DEFAULT 'eastmoney_holding',
+                "更新时间" TEXT NOT NULL,
+                UNIQUE("交易所", "基金代码", "报告期", "股票代码")
+            )
+            """
+        )
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_etf_holding_period '
+            'ON ETF_HOLDING("交易所", "报告期")'
+        )
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_etf_holding_fund '
+            'ON ETF_HOLDING("交易所", "基金代码", "报告期")'
         )
 
     def initialize(self) -> None:
@@ -437,6 +475,66 @@ class ETFDatabase:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def fund_exchanges(self, fund_code: str) -> tuple[str, ...]:
+        with closing(self.connect()) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT exchange FROM ETF WHERE fund_code = ? ORDER BY exchange",
+                (str(fund_code).strip(),),
+            ).fetchall()
+        return tuple(str(row["exchange"]).upper() for row in rows)
+
+    def holding_snapshot_exists(
+        self, exchange: str, fund_code: str, report_period: str
+    ) -> bool:
+        with closing(self.connect()) as conn:
+            row = conn.execute(
+                'SELECT 1 FROM ETF_HOLDING '
+                'WHERE "交易所" = ? AND "基金代码" = ? AND "报告期" = ? LIMIT 1',
+                (str(exchange).strip().upper(), str(fund_code).strip(), report_period),
+            ).fetchone()
+        return row is not None
+
+    def replace_holding_snapshot(
+        self, rows: list[dict], source: str = "eastmoney_holding"
+    ) -> tuple[int, int]:
+        if not rows or not all(isinstance(row, dict) for row in rows):
+            raise ValueError("holding snapshot must contain at least one row")
+        key_fields = ("交易所", "基金代码", "报告期")
+        keys = {tuple(row.get(field) for field in key_fields) for row in rows}
+        if len(keys) != 1 or any(not all(value is not None and value != "" for value in key) for key in keys):
+            raise ValueError("holding snapshot keys must be present and identical")
+        if any(not row.get("股票代码") for row in rows):
+            raise ValueError("holding rows must contain stock codes")
+
+        exchange, fund_code, report_period = next(iter(keys))
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        fields = HOLDING_COLUMNS
+        sql_fields = ", ".join(f'"{field}"' for field in fields)
+        values = [tuple(row.get(field) for field in fields) for row in rows]
+        updates = ", ".join(
+            f'"{field}" = excluded."{field}"'
+            for field in fields
+            if field not in {"交易所", "基金代码", "报告期", "股票代码"}
+        )
+
+        with closing(self.connect()) as conn:
+            with conn:
+                conn.execute(
+                    'DELETE FROM ETF_HOLDING WHERE "交易所" = ? AND "基金代码" = ? AND "报告期" = ?',
+                    (exchange, fund_code, report_period),
+                )
+                placeholders = ", ".join("?" for _ in fields)
+                conn.executemany(
+                    f"""
+                    INSERT INTO ETF_HOLDING ({sql_fields}, "来源", "更新时间")
+                    VALUES ({placeholders}, ?, ?)
+                    ON CONFLICT("交易所", "基金代码", "报告期", "股票代码") DO UPDATE SET
+                        {updates}, "来源" = excluded."来源", "更新时间" = excluded."更新时间"
+                    """,
+                    [item + (source, now) for item in values],
+                )
+        return 1, len(values)
+
     def _recalculate_deltas(self, conn: sqlite3.Connection, fund_codes: list[str]) -> None:
         code_placeholders = ",".join("?" for _ in fund_codes)
         groups = conn.execute(
@@ -589,6 +687,18 @@ class ETFDatabase:
                 }
                 for exchange in ("SSE", "SZSE")
             },
+            "holding": {
+                exchange: {
+                    "min_date": None,
+                    "max_date": None,
+                    "report_count": 0,
+                    "fund_count": 0,
+                    "item_count": 0,
+                    "full_report_count": 0,
+                    "partial_report_count": 0,
+                }
+                for exchange in ("SSE", "SZSE")
+            },
         }
 
         with closing(self.connect()) as conn:
@@ -622,6 +732,22 @@ class ETFDatabase:
                 GROUP BY "交易所"
                 """
             ).fetchall()
+            holding_rows = conn.execute(
+                """
+                SELECT "交易所" AS exchange,
+                       MIN("报告期") AS min_date,
+                       MAX("报告期") AS max_date,
+                       COUNT(DISTINCT "基金代码" || '|' || "报告期") AS report_count,
+                       COUNT(DISTINCT "基金代码") AS fund_count,
+                       COUNT(*) AS item_count,
+                       COUNT(DISTINCT CASE WHEN "数据完整性" = '完整披露'
+                                           THEN "基金代码" || '|' || "报告期" END) AS full_report_count,
+                       COUNT(DISTINCT CASE WHEN "数据完整性" = '部分披露'
+                                           THEN "基金代码" || '|' || "报告期" END) AS partial_report_count
+                FROM ETF_HOLDING
+                GROUP BY "交易所"
+                """
+            ).fetchall()
 
         for row in share_rows:
             exchange = row["exchange"]
@@ -652,5 +778,19 @@ class ETFDatabase:
                 result["component"][exchange]["item_count"] = int(
                     row["item_count"]
                 )
+
+        for row in holding_rows:
+            exchange = row["exchange"]
+            if exchange not in result["holding"]:
+                continue
+            result["holding"][exchange].update(
+                min_date=row["min_date"],
+                max_date=row["max_date"],
+                report_count=int(row["report_count"]),
+                fund_count=int(row["fund_count"]),
+                item_count=int(row["item_count"]),
+                full_report_count=int(row["full_report_count"]),
+                partial_report_count=int(row["partial_report_count"]),
+            )
 
         return result

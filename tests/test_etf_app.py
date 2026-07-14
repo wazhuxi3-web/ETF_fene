@@ -39,6 +39,12 @@ from sse_pcf_fetcher import (
     build_sse_pcf_download_url,
     fetch_sse_pcf_for_fund,
 )
+from eastmoney_holding_fetcher import (
+    EastmoneyHoldingParseError,
+    fetch_eastmoney_holdings,
+    parse_eastmoney_report_dates,
+    parse_eastmoney_holding_response,
+)
 from szse_pcf_fetcher import (
     SZSEPCFBrowserSession,
     SZSEPCFReference,
@@ -51,6 +57,69 @@ from szse_pcf_fetcher import (
 )
 from etf_gui import ETFApp, collection_panel_state, format_coverage_cell
 from etf_web_app import ETFWebServer, HTML, parse_web_endpoint
+
+
+class EastmoneyHoldingParserTests(unittest.TestCase):
+    @staticmethod
+    def _response():
+        content = (
+            '<h4 class="t">2024年1季度股票投资明细</h4>'
+            '<table><tr><th>序号</th><th>股票代码</th><th>股票名称</th>'
+            '<th>占净值比例</th><th>持股数（万股）</th><th>持仓市值（万元）</th></tr>'
+            '<tr><td>1</td><td>600000</td><td>浦发银行</td><td>5.5%</td>'
+            '<td>12.3</td><td>456.7</td></tr></table>'
+            '<h4 class="t">2024年2季度股票投资明细</h4>'
+            '<table><tr><th>序号</th><th>股票代码</th><th>股票名称</th>'
+            '<th>占净值比例</th><th>持股数（万股）</th><th>持仓市值（万元）</th></tr>'
+            '<tr><td>1</td><td>600001</td><td>邯郸钢铁</td><td>2%</td>'
+            '<td>3</td><td>4</td></tr></table>'
+        )
+        return 'var apidata={content:' + json.dumps(content, ensure_ascii=False) + '};'
+
+    def test_parses_all_quarter_tables_and_converts_units(self):
+        rows = parse_eastmoney_holding_response(
+            self._response(), "510010", exchange="SSE", fund_name="治理ETF"
+        )
+        self.assertEqual([row["报告期"] for row in rows], ["2024-03-31", "2024-06-30"])
+        self.assertEqual(rows[0]["基金名称"], "治理ETF")
+        self.assertEqual(rows[0]["持股数"], 123000.0)
+        self.assertEqual(rows[0]["持仓市值"], 4567000.0)
+        self.assertEqual(rows[0]["数据完整性"], "部分披露")
+        self.assertEqual(rows[1]["数据完整性"], "完整披露")
+
+    def test_rejects_response_without_quarter_table(self):
+        with self.assertRaises(EastmoneyHoldingParseError):
+            parse_eastmoney_holding_response('var apidata={content:"<p>暂无数据</p>"};', "510010")
+
+    def test_parses_report_announcement_dates_without_using_report_period_as_available_date(self):
+        payload = json.dumps(
+            {
+                "Data": [
+                    ["510010", "治理ETF：2024年第1季度报告", "治理ETF", "", "", "2024-04-22", "", "AN1"],
+                    ["510010", "治理ETF：2024年半年度报告", "治理ETF", "", "", "2024-08-30", "", "AN2"],
+                    ["510010", "治理ETF：2024年年度报告", "治理ETF", "", "", "2025-03-31", "", "AN3"],
+                ]
+            }
+        )
+        self.assertEqual(
+            parse_eastmoney_report_dates(payload),
+            {"2024-03-31": "2024-04-22", "2024-06-30": "2024-08-30", "2024-12-31": "2025-03-31"},
+        )
+
+    def test_fetch_builds_annual_request_and_parses_response(self):
+        opener = Mock()
+        response = Mock()
+        response.read.return_value = self._response().encode("utf-8")
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        opener.return_value = response
+        rows = fetch_eastmoney_holdings(
+            "510010", 2024, opener=opener, request_interval=0
+        )
+        request = opener.call_args.args[0]
+        self.assertIn("type=jjcc", request.full_url)
+        self.assertIn("year=2024", request.full_url)
+        self.assertEqual(len(rows), 2)
 
 
 class PCFNormalizationTests(unittest.TestCase):
@@ -2357,6 +2426,60 @@ class PCFDatabaseTests(unittest.TestCase):
             self.assertEqual(db.list_fund_codes("SSE"), [{"fund_code": "510010", "fund_name": "治理ETF"}])
 
 
+class HoldingDatabaseTests(unittest.TestCase):
+    @staticmethod
+    def _row(exchange="SSE", code="510010", period="2024-06-30", stock="600000"):
+        return {
+            "交易所": exchange,
+            "基金代码": code,
+            "基金名称": "治理ETF",
+            "报告年度": 2024,
+            "报告季度": 2,
+            "报告期": period,
+            "可用日期": "2024-08-30",
+            "数据完整性": "完整披露",
+            "序号": 1,
+            "股票代码": stock,
+            "股票名称": "浦发银行",
+            "占净值比例": 2.5,
+            "持股数": 100000.0,
+            "持仓市值": 2000000.0,
+            "挂牌市场": "上交所",
+        }
+
+    def test_holding_snapshot_is_replaced_idempotently_and_coverage_is_report_based(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = ETFDatabase(Path(tmp) / "stock_data.db")
+            db.initialize()
+            with closing(db.connect()) as conn:
+                columns = [row["name"] for row in conn.execute("PRAGMA table_info(ETF_HOLDING)")]
+            self.assertEqual(
+                set(columns),
+                {
+                    "编号", "交易所", "基金代码", "基金名称", "报告年度", "报告季度", "报告期",
+                    "可用日期", "数据完整性", "序号", "股票代码", "股票名称", "占净值比例",
+                    "持股数", "持仓市值", "挂牌市场", "来源", "更新时间",
+                },
+            )
+            first = self._row()
+            second = {**first, "股票代码": "600001", "股票名称": "邯郸钢铁"}
+            db.replace_holding_snapshot([first, second])
+            db.replace_holding_snapshot([{**first, "持仓市值": 3000000.0}])
+
+            with closing(db.connect()) as conn:
+                rows = conn.execute(
+                    'SELECT "股票代码", "持仓市值" FROM ETF_HOLDING '
+                    'WHERE "基金代码" = ? ORDER BY "股票代码"',
+                    ("510010",),
+                ).fetchall()
+            self.assertEqual([(row["股票代码"], row["持仓市值"]) for row in rows], [("600000", 3000000.0)])
+            self.assertTrue(db.holding_snapshot_exists("SSE", "510010", "2024-06-30"))
+            coverage = db.get_collection_coverage()["holding"]["SSE"]
+            self.assertEqual(coverage["report_count"], 1)
+            self.assertEqual(coverage["item_count"], 1)
+            self.assertEqual(coverage["full_report_count"], 1)
+
+
 class PCFGuiTests(unittest.TestCase):
     @staticmethod
     def _app():
@@ -2392,6 +2515,10 @@ class PCFGuiTests(unittest.TestCase):
             collection_panel_state("component", "range", "沪深两市")["notice"],
             "选择沪深两市时：上交所更新一次最新快照；深交所按所选日期区间采集。",
         )
+        holding_state = collection_panel_state("holding", "range", "沪深两市")
+        self.assertTrue(holding_state["show_holding_years"])
+        self.assertFalse(holding_state["show_range_dates"])
+        self.assertEqual(holding_state["button_text"], "开始采集季度持仓")
 
     def test_formats_share_and_component_coverage_cells(self):
         self.assertEqual(
@@ -2421,6 +2548,20 @@ class PCFGuiTests(unittest.TestCase):
             "2026-07-13 ~ 2026-07-14 | 5 快照 / 2 只 / 100 成分",
         )
         self.assertEqual(format_coverage_cell("component", {"min_date": None}), "暂无数据")
+        self.assertEqual(
+            format_coverage_cell(
+                "holding",
+                {
+                    "min_date": "2024-03-31",
+                    "max_date": "2024-06-30",
+                    "report_count": 2,
+                    "fund_count": 1,
+                    "item_count": 30,
+                    "full_report_count": 1,
+                },
+            ),
+            "2024-03-31 ~ 2024-06-30 | 2 份报告 / 1 只 / 30 条 / 完整 1",
+        )
 
     def test_gui_uses_unified_collection_form_and_independent_log_scrollbar(self):
         source = Path("etf_gui.py").read_text(encoding="utf-8-sig")
@@ -2434,6 +2575,8 @@ class PCFGuiTests(unittest.TestCase):
         self.assertIn("共同采集范围", build_ui)
         self.assertIn("ETF 份额", build_ui)
         self.assertIn("ETF 成分股", build_ui)
+        self.assertIn("基金季度持仓", build_ui)
+        self.assertIn("报告年度", build_ui)
         self.assertIn("数据库覆盖范围", build_ui)
         self.assertIn("重新采集已有快照", source)
         self.assertIn("log_frame", source)
