@@ -5,6 +5,7 @@ import random
 import re
 import time
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlsplit, urlunsplit
@@ -302,6 +303,37 @@ def extract_szse_pcf_references(payload: list[dict]) -> list[SZSEPCFReference]:
     return references
 
 
+def _validate_szse_snapshot(reference: SZSEPCFReference, info: dict, items: list[dict]) -> None:
+    fund_code = info.get("基金代码") if isinstance(info, dict) else None
+    content_date = info.get("内容日期") if isinstance(info, dict) else None
+    if not isinstance(fund_code, str) or re.fullmatch(r"[0-9]{6}", fund_code) is None:
+        raise ValueError("深交所 PCF 解析基金代码无效")
+    if not isinstance(content_date, str):
+        raise ValueError("深交所 PCF 解析内容日期无效")
+    try:
+        parsed_date = datetime.strptime(content_date, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError("深交所 PCF 解析内容日期无效") from exc
+    if parsed_date.strftime("%Y-%m-%d") != content_date:
+        raise ValueError("深交所 PCF 解析内容日期无效")
+    if not isinstance(items, list) or not items:
+        raise ValueError("深交所 PCF 解析成分为空")
+    if fund_code != reference.fund_code or content_date != reference.content_date:
+        raise ValueError("深交所 PCF 解析结果与下载文件不匹配")
+
+
+@contextmanager
+def _open_szse_pcf_session(session_factory, visible: bool, first_pending_trade_date: str):
+    try:
+        session_manager = session_factory(visible=visible)
+        with session_manager as session:
+            yield session
+    except SZSEPCFPageError:
+        raise
+    except Exception as exc:
+        raise SZSEPCFPageError(first_pending_trade_date, str(exc)) from exc
+
+
 def collect_szse_pcf_via_browser(
     trade_dates: list[str],
     *,
@@ -327,8 +359,10 @@ def collect_szse_pcf_via_browser(
         "failures": [],
     }
     session_factory = session_factory or SZSEPCFBrowserSession
+    if not trade_dates:
+        return summary
 
-    with session_factory(visible=visible) as session:
+    with _open_szse_pcf_session(session_factory, visible, trade_dates[0]) as session:
         for trade_date in trade_dates:
             try:
                 references = session.query(trade_date, fund_code)
@@ -337,48 +371,74 @@ def collect_szse_pcf_via_browser(
             except Exception as exc:
                 raise SZSEPCFPageError(trade_date, str(exc)) from exc
 
-            summary["discovered"] += len(references)
-            if on_progress:
-                on_progress(f"深交所 PCF {trade_date} 发现 {len(references)} 个文件。")
-
+            date_discovered = len(references)
+            date_skipped = 0
+            date_succeeded = 0
+            date_failed = 0
+            date_items = 0
+            pending_references = []
             for reference in references:
-                if not replace_existing and is_complete(reference.fund_code, reference.content_date):
+                if not replace_existing and is_complete(
+                    reference.fund_code, reference.content_date
+                ):
+                    date_skipped += 1
                     summary["skipped"] += 1
-                    continue
-
-                last_error = None
-                for attempt, backoff in enumerate((2, 5, 10, None)):
-                    try:
-                        info, items, mismatches = parse_szse_pcf_download(
-                            session.read_file(reference)
-                        )
-                        save_snapshot(info, items)
-                        summary["succeeded"] += 1
-                        summary["items"] += len(items)
-                        summary["mismatched_amounts"] += mismatches
-                        sleep_func(delay_func())
-                        break
-                    except SZSEPCFPageError:
-                        raise
-                    except Exception as exc:
-                        last_error = exc
-                        if backoff is not None:
-                            sleep_func(backoff)
                 else:
-                    summary["failed"] += 1
-                    failure = {
-                        "date": trade_date,
-                        "fund_code": reference.fund_code,
-                        "error": str(last_error),
-                    }
-                    summary["failures"].append(failure)
-                    if on_progress:
-                        on_progress(
-                            f"深交所 PCF {trade_date} {reference.fund_code} 下载失败: {last_error}"
-                        )
+                    pending_references.append(reference)
+
+            summary["discovered"] += date_discovered
+            if on_progress:
+                on_progress(
+                    f"深交所 PCF {trade_date} 发现 {date_discovered}，跳过 {date_skipped}，"
+                    f"待采 {len(pending_references)}。"
+                )
+
+            for reference in pending_references:
+                last_error = None
+                try:
+                    for backoff in (2, 5, 10, None):
+                        try:
+                            info, items, mismatches = parse_szse_pcf_download(
+                                session.read_file(reference)
+                            )
+                            _validate_szse_snapshot(reference, info, items)
+                            save_snapshot(info, items)
+                            summary["succeeded"] += 1
+                            summary["items"] += len(items)
+                            summary["mismatched_amounts"] += mismatches
+                            date_succeeded += 1
+                            date_items += len(items)
+                            break
+                        except SZSEPCFPageError:
+                            raise
+                        except Exception as exc:
+                            if _is_browser_session_fatal(exc):
+                                raise SZSEPCFPageError(reference.content_date, str(exc)) from exc
+                            last_error = exc
+                            if backoff is not None:
+                                sleep_func(backoff)
+                    else:
+                        summary["failed"] += 1
+                        date_failed += 1
+                        failure = {
+                            "date": trade_date,
+                            "fund_code": reference.fund_code,
+                            "error": str(last_error),
+                        }
+                        summary["failures"].append(failure)
+                        if on_progress:
+                            on_progress(
+                                f"深交所 PCF {trade_date} {reference.fund_code} 下载失败: {last_error}"
+                            )
+                finally:
+                    sleep_func(delay_func())
 
             if on_progress:
-                on_progress(f"深交所 PCF {trade_date} 采集完成。")
+                on_progress(
+                    f"深交所 PCF {trade_date} 采集完成：发现 {date_discovered}，"
+                    f"跳过 {date_skipped}，待采 0，成功 {date_succeeded}，"
+                    f"失败 {date_failed}，成分 {date_items} 行。"
+                )
 
     return summary
 
@@ -399,6 +459,11 @@ def _is_browser_session_fatal(exc: Exception) -> bool:
             "browser closed",
             "context has been closed",
             "context closed",
+            "err_internet_disconnected",
+            "err_network_changed",
+            "err_name_not_resolved",
+            "err_connection_closed",
+            "err_connection_reset",
         )
     )
 

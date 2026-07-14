@@ -397,6 +397,20 @@ EnDeNdEnD
         self.assertEqual(items[0]["替代金额"], 12.5)
         self.assertEqual(mismatches, 0)
 
+    def test_preserves_virtual_security_and_unknown_market_source(self):
+        xml = b"""<PCFFile>
+          <SecurityID>159915</SecurityID><TradingDay>20260714</TradingDay>
+          <Component><UnderlyingSecurityID>159900</UnderlyingSecurityID>
+          <ComponentShare>1</ComponentShare><UnderlyingSecurityIDSource>102</UnderlyingSecurityIDSource></Component>
+          <Component><UnderlyingSecurityID>000001</UnderlyingSecurityID>
+          <ComponentShare>1</ComponentShare><UnderlyingSecurityIDSource>999</UnderlyingSecurityIDSource></Component>
+        </PCFFile>"""
+
+        _, items, _ = parse_szse_pcf_download(xml)
+
+        self.assertEqual([item["证券代码"] for item in items], ["159900", "000001"])
+        self.assertEqual([item["挂牌市场"] for item in items], ["SZSE", "999"])
+
     def test_extracts_download_references_from_report_payload(self):
         payload = [{"data": [{"jjdm": (
             "<a href='/modules/report/views/eft_download_new.html?"
@@ -654,8 +668,139 @@ class SZSEPCFCollectorTests(unittest.TestCase):
         self.assertEqual(summary["failed"], 1)
         self.assertEqual(len(summary["failures"]), 1)
         self.assertEqual([ref.fund_code for ref in fake_session.reads], ["159001"] * 4 + ["159915"])
-        self.assertEqual(sleeps, [2, 5, 10, 0.8])
+        self.assertEqual(sleeps, [2, 5, 10, 0.8, 0.8])
         self.assertEqual(len(saved), 1)
+
+    def test_paces_after_final_file_failure(self):
+        reference = SZSEPCFReference("159915", "2026-07-14", "https://example.test/159915")
+        fake_session = self.FakeSession([reference], {"159915": RuntimeError("download failed")})
+        sleeps = []
+
+        summary = collect_szse_pcf_via_browser(
+            ["2026-07-14"],
+            is_complete=lambda code, date: False,
+            save_snapshot=lambda info, items: None,
+            session_factory=lambda visible=False: fake_session,
+            sleep_func=sleeps.append,
+            delay_func=lambda: 0.8,
+        )
+
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual([ref.fund_code for ref in fake_session.reads], ["159915"] * 4)
+        self.assertEqual(sleeps, [2, 5, 10, 0.8])
+
+    def test_retries_invalid_snapshot_identity_without_writing(self):
+        reference = SZSEPCFReference("159915", "2026-07-14", "https://example.test/159915")
+        cases = {
+            "non-ascii code": ({"基金代码": "１５９９１５", "内容日期": "2026-07-14"}, [{"证券代码": "300001"}]),
+            "invalid date": ({"基金代码": "159915", "内容日期": "2026-02-30"}, [{"证券代码": "300001"}]),
+            "wrong code": ({"基金代码": "159900", "内容日期": "2026-07-14"}, [{"证券代码": "300001"}]),
+            "wrong date": ({"基金代码": "159915", "内容日期": "2026-07-13"}, [{"证券代码": "300001"}]),
+            "no items": ({"基金代码": "159915", "内容日期": "2026-07-14"}, []),
+        }
+
+        for label, parsed in cases.items():
+            with self.subTest(label=label):
+                fake_session = self.FakeSession([reference], {"159915": self.xml})
+                saved = []
+                sleeps = []
+                with patch("szse_pcf_fetcher.parse_szse_pcf_download", return_value=(*parsed, 0)):
+                    summary = collect_szse_pcf_via_browser(
+                        ["2026-07-14"],
+                        is_complete=lambda code, date: False,
+                        save_snapshot=lambda info, items: saved.append((info, items)),
+                        session_factory=lambda visible=False: fake_session,
+                        sleep_func=sleeps.append,
+                        delay_func=lambda: 0.8,
+                    )
+
+                self.assertEqual(summary["succeeded"], 0)
+                self.assertEqual(summary["failed"], 1)
+                self.assertEqual(saved, [])
+                self.assertEqual([ref.fund_code for ref in fake_session.reads], ["159915"] * 4)
+                self.assertEqual(sleeps, [2, 5, 10, 0.8])
+
+    def test_date_logs_include_discovery_and_completion_totals(self):
+        references = [
+            SZSEPCFReference("159001", "2026-07-14", "https://example.test/159001"),
+            SZSEPCFReference("159915", "2026-07-14", "https://example.test/159915"),
+        ]
+        fake_session = self.FakeSession(
+            references, {"159001": self.xml, "159915": self.xml}
+        )
+        messages = []
+
+        collect_szse_pcf_via_browser(
+            ["2026-07-14"],
+            is_complete=lambda code, date: code == "159001",
+            save_snapshot=lambda info, items: None,
+            session_factory=lambda visible=False: fake_session,
+            sleep_func=lambda seconds: None,
+            delay_func=lambda: 0.8,
+            on_progress=messages.append,
+        )
+
+        self.assertEqual(len(messages), 2)
+        for expected in ("发现 2", "跳过 1", "待采 1"):
+            self.assertIn(expected, messages[0])
+        for expected in ("发现 2", "跳过 1", "待采 0", "成功 1", "失败 0", "成分 1"):
+            self.assertIn(expected, messages[1])
+
+    def test_wraps_session_startup_failures_with_first_pending_trade_date(self):
+        class FailingEnter:
+            def __enter__(self):
+                raise RuntimeError("initial page load failed")
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+        def failing_factory(visible=False):
+            raise RuntimeError("session factory failed")
+
+        for label, session_factory, message in (
+            ("factory", failing_factory, "session factory failed"),
+            ("enter", lambda visible=False: FailingEnter(), "initial page load failed"),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(SZSEPCFPageError, message) as caught:
+                    collect_szse_pcf_via_browser(
+                        ["2026-07-14", "2026-07-15"],
+                        is_complete=lambda code, date: False,
+                        save_snapshot=lambda info, items: None,
+                        session_factory=session_factory,
+                    )
+
+                self.assertEqual(caught.exception.trade_date, "2026-07-14")
+
+    def test_converts_global_browser_network_failures_to_page_error(self):
+        reference = SZSEPCFReference("159915", "2026-07-14", "https://example.test/159915")
+        for marker in (
+            "ERR_INTERNET_DISCONNECTED",
+            "ERR_NETWORK_CHANGED",
+            "ERR_NAME_NOT_RESOLVED",
+            "ERR_CONNECTION_CLOSED",
+            "ERR_CONNECTION_RESET",
+        ):
+            with self.subTest(marker=marker):
+                fake_session = self.FakeSession(
+                    [reference], {"159915": RuntimeError(f"net::{marker}")}
+                )
+                sleeps = []
+
+                with self.assertRaisesRegex(SZSEPCFPageError, marker) as caught:
+                    collect_szse_pcf_via_browser(
+                        ["2026-07-14", "2026-07-15"],
+                        is_complete=lambda code, date: False,
+                        save_snapshot=lambda info, items: None,
+                        session_factory=lambda visible=False: fake_session,
+                        sleep_func=sleeps.append,
+                        delay_func=lambda: 0.8,
+                    )
+
+                self.assertEqual(caught.exception.trade_date, "2026-07-14")
+                self.assertEqual(fake_session.queries, [("2026-07-14", "")])
+                self.assertEqual([ref.fund_code for ref in fake_session.reads], ["159915"])
+                self.assertEqual(sleeps, [0.8])
 
     def test_wraps_query_failure_with_the_current_trade_date(self):
         fake_session = self.FakeSession([], {})
@@ -702,7 +847,9 @@ class SZSEPCFCollectorTests(unittest.TestCase):
         self.assertEqual(caught.exception.trade_date, "2026-07-14")
         self.assertEqual(fake_session.queries, [("2026-07-14", "")])
         self.assertEqual([ref.fund_code for ref in fake_session.reads], ["159915"])
-        self.assertEqual(sleeps, [])
+        self.assertEqual(len(sleeps), 1)
+        self.assertGreaterEqual(sleeps[0], 0.8)
+        self.assertLessEqual(sleeps[0], 1.8)
         self.assertTrue(fake_session.closed)
 
     def test_browser_session_launches_and_queries_through_one_context(self):
@@ -942,7 +1089,9 @@ class SZSEPCFCollectorTests(unittest.TestCase):
         self.assertEqual(session.queries, [("2026-07-14", "")])
         self.assertEqual(len(session.reads), 1)
         self.assertEqual(session.context.new_page_calls, 1)
-        self.assertEqual(sleeps, [])
+        self.assertEqual(len(sleeps), 1)
+        self.assertGreaterEqual(sleeps[0], 0.8)
+        self.assertLessEqual(sleeps[0], 1.8)
         self.assertTrue(session.closed)
 
     def test_collector_preserves_fatal_navigation_error_when_page_close_also_fails(self):
@@ -1024,7 +1173,9 @@ class SZSEPCFCollectorTests(unittest.TestCase):
                 self.assertEqual(session.queries, [("2026-07-14", "")])
                 self.assertEqual(len(session.reads), 1)
                 self.assertEqual(session.context.new_page_calls, 1)
-                self.assertEqual(sleeps, [])
+                self.assertEqual(len(sleeps), 1)
+                self.assertGreaterEqual(sleeps[0], 0.8)
+                self.assertLessEqual(sleeps[0], 1.8)
                 self.assertTrue(session.closed)
 
     def test_read_file_closes_download_page_when_body_read_fails(self):
@@ -1964,6 +2115,47 @@ class PCFDatabaseTests(unittest.TestCase):
             self.assertEqual(info_source, "szse_pcf_browser")
             self.assertEqual(item_source, "szse_pcf_browser")
 
+    def test_snapshot_replacement_rolls_back_after_item_insert_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = ETFDatabase(Path(tmp) / "stock_data.db")
+            db.initialize()
+            info = {**self._info("2026-07-14"), "交易所": "SZSE", "基金代码": "159915"}
+            original_item = {
+                **self._item("300001", "2026-07-14"),
+                "交易所": "SZSE",
+                "基金代码": "159915",
+                "挂牌市场": "SZSE",
+            }
+            failed_item = {**original_item, "证券代码": "300002"}
+            db.replace_pcf_snapshot(info, [original_item], source="original")
+
+            with closing(db.connect()) as conn:
+                conn.execute(
+                    '''CREATE TRIGGER fail_replacement_item BEFORE INSERT ON ETF_ITEM
+                    WHEN NEW."证券代码" = '300002'
+                    BEGIN SELECT RAISE(ABORT, 'forced item insert failure'); END'''
+                )
+                conn.commit()
+
+            replacement_info = {**info, "基金名称": "replacement"}
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "forced item insert failure"):
+                db.replace_pcf_snapshot(replacement_info, [failed_item], source="replacement")
+
+            with closing(db.connect()) as conn:
+                item_rows = conn.execute(
+                    'SELECT "证券代码", source FROM ETF_ITEM '
+                    'WHERE "交易所" = ? AND "基金代码" = ? AND "内容日期" = ?',
+                    ("SZSE", "159915", "2026-07-14"),
+                ).fetchall()
+                info_row = conn.execute(
+                    'SELECT "基金名称", source FROM ETF_INFO '
+                    'WHERE "交易所" = ? AND "基金代码" = ? AND "内容日期" = ?',
+                    ("SZSE", "159915", "2026-07-14"),
+                ).fetchone()
+
+            self.assertEqual([(row["证券代码"], row["source"]) for row in item_rows], [("300001", "original")])
+            self.assertEqual((info_row["基金名称"], info_row["source"]), (info["基金名称"], "original"))
+
     def test_lists_distinct_fund_codes_for_pcf_batch(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = ETFDatabase(Path(tmp) / "stock_data.db")
@@ -2022,8 +2214,8 @@ class PCFGuiTests(unittest.TestCase):
         self.assertEqual(
             app._fetch_szse_pcf_dates.call_args_list,
             [
-                call(["2026-07-14"], "159915", True),
-                call(["2026-07-13"], "159915", True),
+                call(["2026-07-14"], "159915", True, mode="current", fallback_pending=True),
+                call(["2026-07-13"], "159915", True, mode="current", fallback_pending=False),
             ],
         )
         app.db.latest_stock_trading_date.assert_called_once_with("2026-07-14")
@@ -2037,7 +2229,9 @@ class PCFGuiTests(unittest.TestCase):
             app._fetch_szse_pcf_current("", False)
 
         app.db.latest_stock_trading_date.assert_not_called()
-        app._fetch_szse_pcf_dates.assert_called_once_with(["2026-07-14"], "", False)
+        app._fetch_szse_pcf_dates.assert_called_once_with(
+            ["2026-07-14"], "", False, mode="current", fallback_pending=True
+        )
 
     def test_history_uses_only_stock_daily_trading_dates(self):
         app = self._app()
@@ -2053,7 +2247,9 @@ class PCFGuiTests(unittest.TestCase):
         app.db.list_stock_trading_dates.assert_called_once_with(
             "2026-07-10", "2026-07-14"
         )
-        app._fetch_szse_pcf_dates.assert_called_once_with(dates, "159915", False)
+        app._fetch_szse_pcf_dates.assert_called_once_with(
+            dates, "159915", False, mode="history", fallback_pending=False
+        )
 
     def test_collector_uses_hidden_browser_and_atomic_szse_source(self):
         app = self._app()
@@ -2097,9 +2293,11 @@ class PCFGuiTests(unittest.TestCase):
         self.assertEqual(
             app.paused_pcf_task,
             {
+                "mode": "history",
                 "dates": ["2026-07-11", "2026-07-14"],
                 "code": "159915",
                 "replace": True,
+                "fallback_pending": False,
             },
         )
 
@@ -2107,9 +2305,11 @@ class PCFGuiTests(unittest.TestCase):
         app = self._app()
         paused_dates = ["2026-07-14"]
         app.paused_pcf_task = {
+            "mode": "history",
             "dates": paused_dates,
             "code": "159915",
             "replace": False,
+            "fallback_pending": False,
         }
         app.paused_task = ("single", "SSE", "2026-07-10", "2026-07-10")
         app._fetch_szse_pcf_dates = Mock(return_value={"discovered": 1})
@@ -2128,7 +2328,7 @@ class PCFGuiTests(unittest.TestCase):
         check_sse.assert_not_called()
         app.db.list_stock_trading_dates.assert_not_called()
         app._fetch_szse_pcf_dates.assert_called_once_with(
-            paused_dates, "159915", False
+            paused_dates, "159915", False, mode="history", fallback_pending=False
         )
         self.assertIsNone(app.paused_pcf_task)
         self.assertEqual(
@@ -2140,9 +2340,11 @@ class PCFGuiTests(unittest.TestCase):
         app = self._app()
         paused_dates = ["2026-07-10", "2026-07-13"]
         paused_task = {
+            "mode": "history",
             "dates": paused_dates,
             "code": "",
             "replace": True,
+            "fallback_pending": False,
         }
         app.paused_pcf_task = paused_task
         app._fetch_szse_pcf_dates = Mock(side_effect=RuntimeError("dispatch failed"))
@@ -2153,9 +2355,63 @@ class PCFGuiTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "dispatch failed"):
                 app._test_connection_and_resume()
 
-        app._fetch_szse_pcf_dates.assert_called_once_with(paused_dates, "", True)
+        app._fetch_szse_pcf_dates.assert_called_once_with(
+            paused_dates, "", True, mode="history", fallback_pending=False
+        )
         self.assertIs(app.paused_pcf_task, paused_task)
         app.db.list_stock_trading_dates.assert_not_called()
+
+    def test_current_resume_retries_paused_date_then_falls_back_once_after_zero_discovery(self):
+        app = self._app()
+        app.paused_pcf_task = {
+            "mode": "current",
+            "dates": ["2026-07-14"],
+            "code": "159915",
+            "replace": False,
+            "fallback_pending": True,
+        }
+        app.db.latest_stock_trading_date.return_value = "2026-07-13"
+        app._fetch_szse_pcf_dates = Mock(
+            side_effect=[{"discovered": 0}, {"discovered": 1}]
+        )
+
+        with patch(
+            "etf_gui.check_szse_pcf_connection", return_value=(True, "PCF connected")
+        ) as check_pcf:
+            app._test_connection_and_resume()
+
+        check_pcf.assert_called_once_with("2026-07-14")
+        app.db.latest_stock_trading_date.assert_called_once_with("2026-07-14")
+        self.assertEqual(
+            app._fetch_szse_pcf_dates.call_args_list,
+            [
+                call(["2026-07-14"], "159915", False, mode="current", fallback_pending=True),
+                call(["2026-07-13"], "159915", False, mode="current", fallback_pending=False),
+            ],
+        )
+        self.assertIsNone(app.paused_pcf_task)
+
+    def test_current_resume_after_fallback_retries_only_the_paused_date(self):
+        app = self._app()
+        app.paused_pcf_task = {
+            "mode": "current",
+            "dates": ["2026-07-13"],
+            "code": "159915",
+            "replace": True,
+            "fallback_pending": False,
+        }
+        app._fetch_szse_pcf_dates = Mock(return_value={"discovered": 1})
+
+        with patch(
+            "etf_gui.check_szse_pcf_connection", return_value=(True, "PCF connected")
+        ):
+            app._test_connection_and_resume()
+
+        app.db.latest_stock_trading_date.assert_not_called()
+        app._fetch_szse_pcf_dates.assert_called_once_with(
+            ["2026-07-13"], "159915", True, mode="current", fallback_pending=False
+        )
+        self.assertIsNone(app.paused_pcf_task)
 
     def test_legacy_share_resume_still_dispatches_when_no_pcf_is_paused(self):
         app = self._app()

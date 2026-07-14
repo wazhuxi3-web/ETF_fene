@@ -361,16 +361,30 @@ class ETFApp:
         self.paused_pcf_task = None
         self._run(lambda: self._fetch_szse_pcf_current(code, replace_existing))
 
-    def _fetch_szse_pcf_current(self, code, replace_existing):
-        today = datetime.now().strftime("%Y-%m-%d")
-        summary = self._fetch_szse_pcf_dates([today], code, replace_existing)
-        if summary is None or summary["discovered"] != 0:
+    def _fetch_szse_pcf_current(
+        self, code, replace_existing, current_date=None, fallback_pending=True
+    ):
+        today = current_date or datetime.now().strftime("%Y-%m-%d")
+        summary = self._fetch_szse_pcf_dates(
+            [today],
+            code,
+            replace_existing,
+            mode="current",
+            fallback_pending=fallback_pending,
+        )
+        if summary is None or summary["discovered"] != 0 or not fallback_pending:
             return summary
 
         latest_date = self.db.latest_stock_trading_date(today)
         if latest_date and latest_date != today:
             self.log(f"深交所当前 PCF 当日未发现文件，改采最近股票交易日 {latest_date}。")
-            return self._fetch_szse_pcf_dates([latest_date], code, replace_existing)
+            return self._fetch_szse_pcf_dates(
+                [latest_date],
+                code,
+                replace_existing,
+                mode="current",
+                fallback_pending=False,
+            )
         return summary
 
     def fetch_szse_pcf_history(self):
@@ -390,9 +404,13 @@ class ETFApp:
         if not dates:
             self.log("深交所历史 PCF 未找到股票交易日，未开始采集。")
             return None
-        return self._fetch_szse_pcf_dates(dates, code, replace_existing)
+        return self._fetch_szse_pcf_dates(
+            dates, code, replace_existing, mode="history", fallback_pending=False
+        )
 
-    def _fetch_szse_pcf_dates(self, dates, code, replace_existing):
+    def _fetch_szse_pcf_dates(
+        self, dates, code, replace_existing, *, mode="history", fallback_pending=False
+    ):
         try:
             return collect_szse_pcf_via_browser(
                 dates,
@@ -406,11 +424,13 @@ class ETFApp:
                 visible=False,
             )
         except SZSEPCFPageError as exc:
-            failure_index = dates.index(exc.trade_date)
+            failure_index = dates.index(exc.trade_date) if exc.trade_date in dates else 0
             self.paused_pcf_task = {
+                "mode": mode,
                 "dates": list(dates[failure_index:]),
                 "code": code,
                 "replace": replace_existing,
+                "fallback_pending": fallback_pending,
             }
             self.log(f"深交所 PCF {exc.trade_date} 页面查询失败，已暂停且不会跳过该日期: {exc}")
             self.log("请先点“测试连通性/继续采集”；测通后会从暂停日期继续。")
@@ -567,7 +587,23 @@ class ETFApp:
             if not ok:
                 return
             self.log(f"继续采集深交所 PCF: {dates[0]} ~ {dates[-1]}。")
-            self._fetch_szse_pcf_dates(dates, task["code"], task["replace"])
+            mode = task.get("mode", "history")
+            fallback_pending = task.get("fallback_pending", False)
+            if mode == "current":
+                self._fetch_szse_pcf_current(
+                    task["code"],
+                    task["replace"],
+                    current_date=dates[0],
+                    fallback_pending=fallback_pending,
+                )
+            else:
+                self._fetch_szse_pcf_dates(
+                    dates,
+                    task["code"],
+                    task["replace"],
+                    mode=mode,
+                    fallback_pending=fallback_pending,
+                )
             if self.paused_pcf_task is task:
                 self.paused_pcf_task = None
             return
