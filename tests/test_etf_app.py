@@ -928,6 +928,88 @@ class SZSEPCFCollectorTests(unittest.TestCase):
         self.assertEqual(sleeps, [])
         self.assertTrue(session.closed)
 
+    def test_collector_preserves_fatal_navigation_error_when_page_close_also_fails(self):
+        class TargetClosedError(RuntimeError):
+            pass
+
+        final = self.FakeResponse(
+            "https://www.szse.cn/files/text/ETFDown/ETF15991520260714.txt",
+            body=self.xml,
+        )
+        reference = SZSEPCFReference(
+            "159915", "2026-07-14", "https://example.test/download"
+        )
+
+        for failure_stage in ("goto", "wait_for_url"):
+            with self.subTest(failure_stage=failure_stage):
+                class DownloadPage:
+                    def expect_response(self, predicate, timeout):
+                        return SZSEPCFCollectorTests.FakeExpectation(final)
+
+                    def goto(self, url, **kwargs):
+                        if failure_stage == "goto":
+                            raise TargetClosedError("original goto failure")
+
+                    def wait_for_url(self, url, timeout):
+                        if failure_stage == "wait_for_url":
+                            raise TargetClosedError("original wait_for_url failure")
+
+                    def close(self):
+                        raise RuntimeError("download page close failure")
+
+                class ReusableContext:
+                    def __init__(self):
+                        self.new_page_calls = 0
+
+                    def new_page(self):
+                        self.new_page_calls += 1
+                        return DownloadPage()
+
+                class BrowserBackedSession:
+                    def __init__(self):
+                        self.browser_session = SZSEPCFBrowserSession()
+                        self.context = ReusableContext()
+                        self.browser_session.context = self.context
+                        self.queries = []
+                        self.reads = []
+                        self.closed = False
+
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, exc_type, exc, traceback):
+                        self.closed = True
+
+                    def query(self, trade_date, fund_code=""):
+                        self.queries.append((trade_date, fund_code))
+                        return [reference]
+
+                    def read_file(self, requested_reference):
+                        self.reads.append(requested_reference)
+                        return self.browser_session.read_file(requested_reference)
+
+                session = BrowserBackedSession()
+                sleeps = []
+
+                with self.assertRaisesRegex(
+                    SZSEPCFPageError, f"original {failure_stage} failure"
+                ) as caught:
+                    collect_szse_pcf_via_browser(
+                        ["2026-07-14", "2026-07-15"],
+                        is_complete=lambda code, date: False,
+                        save_snapshot=lambda info, items: None,
+                        session_factory=lambda visible=False: session,
+                        sleep_func=lambda seconds: sleeps.append(seconds),
+                    )
+
+                self.assertNotIn("close failure", str(caught.exception))
+                self.assertEqual(caught.exception.trade_date, "2026-07-14")
+                self.assertEqual(session.queries, [("2026-07-14", "")])
+                self.assertEqual(len(session.reads), 1)
+                self.assertEqual(session.context.new_page_calls, 1)
+                self.assertEqual(sleeps, [])
+                self.assertTrue(session.closed)
+
     def test_read_file_closes_download_page_when_body_read_fails(self):
         class FailingResponse(self.FakeResponse):
             def body(self):
