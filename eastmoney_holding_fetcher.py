@@ -43,6 +43,10 @@ class EastmoneyHoldingParseError(EastmoneyHoldingError):
     """东方财富返回内容不是可识别的季度持仓数据。"""
 
 
+class EastmoneyHoldingNoDataError(EastmoneyHoldingError):
+    """基金在该年度没有可披露的股票季度持仓。"""
+
+
 def _clean_text(value) -> str | None:
     if value is None:
         return None
@@ -295,6 +299,9 @@ def parse_eastmoney_holding_response(
             if item["股票代码"]:
                 result.append(item)
     if not result:
+        no_data_markers = ("暂无数据", "暂无持仓", "没有数据", "无相关数据", "未披露")
+        if not parser.tables or any(marker in content for marker in no_data_markers):
+            raise EastmoneyHoldingNoDataError("该基金该年度没有可识别的季度股票持仓")
         raise EastmoneyHoldingParseError("返回内容中没有可识别的季度持仓表")
     return result
 
@@ -431,5 +438,7 @@ def check_eastmoney_holding_connection(
             request_interval=0,
         )
         return True, f"东方财富持仓接口正常，测试基金返回 {len(rows)} 条记录。"
+    except EastmoneyHoldingNoDataError:
+        return True, "东方财富持仓接口正常，但测试基金该年度没有股票季度持仓。"
     except Exception as exc:
         return False, f"东方财富持仓接口未连通: {exc}"

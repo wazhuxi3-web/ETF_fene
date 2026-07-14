@@ -27,6 +27,7 @@ from szse_download_fetcher import (
 from sse_pcf_fetcher import fetch_sse_pcf_for_fund
 from eastmoney_holding_fetcher import (
     EastmoneyHoldingError,
+    EastmoneyHoldingNoDataError,
     check_eastmoney_holding_connection,
     fetch_eastmoney_holdings,
 )
@@ -701,6 +702,12 @@ class ETFApp:
                         self.log(
                             f"基金季度持仓进度 {completed}/{len(tasks)}，最近处理 {fund_code} {year} 年。"
                         )
+                except EastmoneyHoldingNoDataError as exc:
+                    completed += 1
+                    completed_tasks.add(task)
+                    self.log(f"基金季度持仓 {fund_code} {year} 年无股票持仓，已跳过：{exc}")
+                    if completed == 1 or completed % 25 == 0 or completed == len(tasks):
+                        self.log(f"基金季度持仓进度 {completed}/{len(tasks)}，最近跳过 {fund_code} {year} 年。")
                 except EastmoneyHoldingError as exc:
                     self.paused_holding_task = {
                         "tasks": [item for item in tasks if item not in completed_tasks],
@@ -1267,6 +1274,10 @@ class ETFApp:
                     completed_tasks.add(task)
                     if completed == 1 or completed % 25 == 0 or completed == len(tasks):
                         self.log(f"季度持仓续采进度 {completed}/{len(tasks)}，最近处理 {fund_code} {year} 年。")
+                except EastmoneyHoldingNoDataError as exc:
+                    completed += 1
+                    completed_tasks.add(task)
+                    self.log(f"季度持仓续采 {fund_code} {year} 年无股票持仓，已跳过：{exc}")
                 except Exception as exc:
                     self.paused_holding_task = {
                         "tasks": [item for item in tasks if item not in completed_tasks],

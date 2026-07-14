@@ -41,6 +41,8 @@ from sse_pcf_fetcher import (
 )
 from eastmoney_holding_fetcher import (
     EastmoneyHoldingParseError,
+    EastmoneyHoldingNoDataError,
+    check_eastmoney_holding_connection,
     fetch_eastmoney_holdings,
     parse_eastmoney_report_dates,
     parse_eastmoney_holding_response,
@@ -87,9 +89,20 @@ class EastmoneyHoldingParserTests(unittest.TestCase):
         self.assertEqual(rows[0]["数据完整性"], "部分披露")
         self.assertEqual(rows[1]["数据完整性"], "完整披露")
 
-    def test_rejects_response_without_quarter_table(self):
-        with self.assertRaises(EastmoneyHoldingParseError):
+    def test_marks_explicit_empty_response_as_no_data(self):
+        with self.assertRaises(EastmoneyHoldingNoDataError):
             parse_eastmoney_holding_response('var apidata={content:"<p>暂无数据</p>"};', "510010")
+
+    def test_connection_probe_treats_no_holdings_as_reachable(self):
+        opener = Mock()
+        response = Mock()
+        response.read.return_value = 'var apidata={content:"<p>暂无数据</p>"};'.encode("utf-8")
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        opener.return_value = response
+        ok, message = check_eastmoney_holding_connection("159001", 2016, opener=opener)
+        self.assertTrue(ok)
+        self.assertIn("没有股票季度持仓", message)
 
     def test_parses_report_announcement_dates_without_using_report_period_as_available_date(self):
         payload = json.dumps(
