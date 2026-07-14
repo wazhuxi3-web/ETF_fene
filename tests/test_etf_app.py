@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 from openpyxl import Workbook
 
 from etf_database import ETFDatabase
@@ -49,6 +49,7 @@ from szse_pcf_fetcher import (
     extract_szse_pcf_references,
     parse_szse_pcf_download,
 )
+from etf_gui import ETFApp
 from etf_web_app import ETFWebServer, HTML, parse_web_endpoint
 
 
@@ -1963,7 +1964,21 @@ class PCFDatabaseTests(unittest.TestCase):
 
 
 class PCFGuiTests(unittest.TestCase):
-    def test_gui_has_pcf_actions_and_independent_log_scrollbar(self):
+    @staticmethod
+    def _app():
+        app = ETFApp.__new__(ETFApp)
+        app.db = Mock()
+        app.log = Mock()
+        app.paused_task = None
+        app.paused_pcf_task = None
+        app.date_var = Mock()
+        app.date_var.get.return_value = "2026-07-14"
+        app.workers_var = Mock()
+        app.workers_var.get.return_value = "4"
+        app._selected_exchanges = Mock(return_value=("SSE",))
+        return app
+
+    def test_gui_keeps_pcf_actions_and_independent_log_scrollbar(self):
         source = Path("etf_gui.py").read_text(encoding="utf-8-sig")
         self.assertIn("fetch_sse_pcf_for_fund", source)
         self.assertIn("采集当前 PCF", source)
@@ -1972,13 +1987,195 @@ class PCFGuiTests(unittest.TestCase):
         self.assertIn("采集深交所当前 PCF", source)
         self.assertIn("采集深交所历史 PCF", source)
         self.assertIn("重新采集已有快照", source)
-        self.assertIn("collect_szse_pcf_via_browser", source)
-        self.assertIn("check_szse_pcf_connection", source)
-        self.assertIn("list_stock_trading_dates", source)
-        self.assertIn("replace_pcf_snapshot", source)
         self.assertIn("log_frame", source)
         self.assertIn("log_scrollbar", source)
         self.assertIn("yscrollcommand=log_scrollbar.set", source)
+
+    def test_current_queries_today_then_latest_stock_day_after_zero_discovery(self):
+        app = self._app()
+        app.db.latest_stock_trading_date.return_value = "2026-07-13"
+        app._fetch_szse_pcf_dates = Mock(
+            side_effect=[{"discovered": 0}, {"discovered": 2}]
+        )
+
+        with patch("etf_gui.datetime") as mocked_datetime:
+            mocked_datetime.now.return_value.strftime.return_value = "2026-07-14"
+            result = app._fetch_szse_pcf_current("159915", True)
+
+        self.assertEqual(result, {"discovered": 2})
+        self.assertEqual(
+            app._fetch_szse_pcf_dates.call_args_list,
+            [
+                call(["2026-07-14"], "159915", True),
+                call(["2026-07-13"], "159915", True),
+            ],
+        )
+        app.db.latest_stock_trading_date.assert_called_once_with("2026-07-14")
+
+    def test_current_does_not_look_up_latest_day_when_today_has_files(self):
+        app = self._app()
+        app._fetch_szse_pcf_dates = Mock(return_value={"discovered": 1})
+
+        with patch("etf_gui.datetime") as mocked_datetime:
+            mocked_datetime.now.return_value.strftime.return_value = "2026-07-14"
+            app._fetch_szse_pcf_current("", False)
+
+        app.db.latest_stock_trading_date.assert_not_called()
+        app._fetch_szse_pcf_dates.assert_called_once_with(["2026-07-14"], "", False)
+
+    def test_history_uses_only_stock_daily_trading_dates(self):
+        app = self._app()
+        dates = ["2026-07-10", "2026-07-13"]
+        app.db.list_stock_trading_dates.return_value = dates
+        app._fetch_szse_pcf_dates = Mock(return_value={"discovered": 2})
+
+        result = app._fetch_szse_pcf_history(
+            "2026-07-10", "2026-07-14", "159915", False
+        )
+
+        self.assertEqual(result, {"discovered": 2})
+        app.db.list_stock_trading_dates.assert_called_once_with(
+            "2026-07-10", "2026-07-14"
+        )
+        app._fetch_szse_pcf_dates.assert_called_once_with(dates, "159915", False)
+
+    def test_collector_uses_hidden_browser_and_atomic_szse_source(self):
+        app = self._app()
+        app.db.pcf_is_complete.return_value = True
+        summary = {"discovered": 1}
+
+        with patch(
+            "etf_gui.collect_szse_pcf_via_browser", return_value=summary
+        ) as collect:
+            result = app._fetch_szse_pcf_dates(["2026-07-14"], "159915", True)
+
+        self.assertEqual(result, summary)
+        kwargs = collect.call_args.kwargs
+        self.assertEqual(collect.call_args.args, (["2026-07-14"],))
+        self.assertEqual(kwargs["fund_code"], "159915")
+        self.assertTrue(kwargs["replace_existing"])
+        self.assertFalse(kwargs["visible"])
+        self.assertIs(kwargs["on_progress"], app.log)
+        self.assertTrue(kwargs["is_complete"]("159915", "2026-07-14"))
+        app.db.pcf_is_complete.assert_called_once_with(
+            "SZSE", "159915", "2026-07-14"
+        )
+        info = {"基金代码": "159915"}
+        items = [{"证券代码": "300001"}]
+        kwargs["save_snapshot"](info, items)
+        app.db.replace_pcf_snapshot.assert_called_once_with(
+            info, items, source="szse_pcf_browser"
+        )
+
+    def test_page_error_pauses_exact_original_remaining_dates(self):
+        app = self._app()
+        dates = ["2026-07-10", "2026-07-11", "2026-07-14"]
+
+        with patch(
+            "etf_gui.collect_szse_pcf_via_browser",
+            side_effect=SZSEPCFPageError("2026-07-11", "page failed"),
+        ):
+            result = app._fetch_szse_pcf_dates(dates, "159915", True)
+
+        self.assertIsNone(result)
+        self.assertEqual(
+            app.paused_pcf_task,
+            {
+                "dates": ["2026-07-11", "2026-07-14"],
+                "code": "159915",
+                "replace": True,
+            },
+        )
+
+    def test_pcf_resume_retries_exact_dates_before_legacy_share_resume(self):
+        app = self._app()
+        paused_dates = ["2026-07-14"]
+        app.paused_pcf_task = {
+            "dates": paused_dates,
+            "code": "159915",
+            "replace": False,
+        }
+        app.paused_task = ("single", "SSE", "2026-07-10", "2026-07-10")
+        app._fetch_szse_pcf_dates = Mock(return_value={"discovered": 1})
+        app._fetch_date = Mock()
+
+        with (
+            patch(
+                "etf_gui.check_szse_pcf_connection",
+                return_value=(True, "PCF connected"),
+            ) as check_pcf,
+            patch("etf_gui.check_sse_connection") as check_sse,
+        ):
+            app._test_connection_and_resume()
+
+        check_pcf.assert_called_once_with("2026-07-14")
+        check_sse.assert_not_called()
+        app.db.list_stock_trading_dates.assert_not_called()
+        app._fetch_szse_pcf_dates.assert_called_once_with(
+            paused_dates, "159915", False
+        )
+        self.assertIsNone(app.paused_pcf_task)
+        self.assertEqual(
+            app.paused_task, ("single", "SSE", "2026-07-10", "2026-07-10")
+        )
+        app._fetch_date.assert_not_called()
+
+    def test_history_resume_keeps_exact_dates_and_pause_when_dispatch_raises(self):
+        app = self._app()
+        paused_dates = ["2026-07-10", "2026-07-13"]
+        paused_task = {
+            "dates": paused_dates,
+            "code": "",
+            "replace": True,
+        }
+        app.paused_pcf_task = paused_task
+        app._fetch_szse_pcf_dates = Mock(side_effect=RuntimeError("dispatch failed"))
+
+        with patch(
+            "etf_gui.check_szse_pcf_connection", return_value=(True, "PCF connected")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "dispatch failed"):
+                app._test_connection_and_resume()
+
+        app._fetch_szse_pcf_dates.assert_called_once_with(paused_dates, "", True)
+        self.assertIs(app.paused_pcf_task, paused_task)
+        app.db.list_stock_trading_dates.assert_not_called()
+
+    def test_legacy_share_resume_still_dispatches_when_no_pcf_is_paused(self):
+        app = self._app()
+        app.paused_task = ("single", "SSE", "2026-07-10", "2026-07-10")
+        app._fetch_date = Mock()
+
+        with patch(
+            "etf_gui.check_sse_connection", return_value=(True, "SSE connected")
+        ):
+            app._test_connection_and_resume()
+
+        app._fetch_date.assert_called_once_with(
+            "2026-07-10",
+            exchange="SSE",
+            pause_task=("single", "SSE", "2026-07-10", "2026-07-10"),
+        )
+        self.assertIsNone(app.paused_task)
+
+    def test_szse_code_accepts_empty_or_six_ascii_digits(self):
+        app = self._app()
+        for code in ("", "159915"):
+            with self.subTest(code=code):
+                app.pcf_code_var = Mock()
+                app.pcf_code_var.get.return_value = code
+                self.assertEqual(app._szse_pcf_code_or_none(), code)
+
+    def test_szse_code_rejects_full_width_digits(self):
+        app = self._app()
+        app.pcf_code_var = Mock()
+        app.pcf_code_var.get.return_value = "１５９９１５"
+
+        with patch("etf_gui.messagebox.showerror") as showerror:
+            result = app._szse_pcf_code_or_none()
+
+        self.assertIsNone(result)
+        showerror.assert_called_once()
 
 
 class ETFWebServerTests(unittest.TestCase):

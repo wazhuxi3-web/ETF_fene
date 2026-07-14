@@ -348,7 +348,7 @@ class ETFApp:
 
     def _szse_pcf_code_or_none(self):
         code = self.pcf_code_var.get().strip()
-        if code and (not code.isdigit() or len(code) != 6):
+        if code and not (len(code) == 6 and code.isascii() and code.isdigit()):
             messagebox.showerror("基金代码错误", "基金代码可留空；填写时请输入 6 位数字。")
             return None
         return code
@@ -406,9 +406,9 @@ class ETFApp:
                 visible=False,
             )
         except SZSEPCFPageError as exc:
+            failure_index = dates.index(exc.trade_date)
             self.paused_pcf_task = {
-                "current": exc.trade_date,
-                "end": dates[-1],
+                "dates": list(dates[failure_index:]),
                 "code": code,
                 "replace": replace_existing,
             }
@@ -557,18 +557,19 @@ class ETFApp:
     def _test_connection_and_resume(self):
         if self.paused_pcf_task:
             task = self.paused_pcf_task
-            current = task["current"]
+            dates = list(task["dates"])
+            if not dates:
+                self.log("深交所 PCF 暂停任务没有待采日期，无法继续采集。")
+                return
+            current = dates[0]
             ok, message = check_szse_pcf_connection(current)
             self.log(message)
             if not ok:
                 return
-            dates = self.db.list_stock_trading_dates(current, task["end"])
-            self.paused_pcf_task = None
-            if not dates:
-                self.log("深交所 PCF 暂停区间未找到股票交易日，无法继续采集。")
-                return
             self.log(f"继续采集深交所 PCF: {dates[0]} ~ {dates[-1]}。")
             self._fetch_szse_pcf_dates(dates, task["code"], task["replace"])
+            if self.paused_pcf_task is task:
+                self.paused_pcf_task = None
             return
 
         if self.paused_task and len(self.paused_task) == 4:
