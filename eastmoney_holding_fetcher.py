@@ -281,6 +281,11 @@ def parse_eastmoney_holding_response(
             "持仓市值万元": "持仓市值",
         }
         for raw_row in rows[1:]:
+            # A few OTC rows have malformed HTML: the related-links cell is
+            # missing its closing span, so the parser sees one fewer cell.
+            if len(raw_row) == len(headers) - 1 and "相关资讯" in headers:
+                related_index = headers.index("相关资讯")
+                raw_row = raw_row[:related_index] + [""] + raw_row[related_index:]
             padded = raw_row + [""] * max(0, len(headers) - len(raw_row))
             values = {}
             for header, value in zip(headers, padded):
@@ -333,59 +338,70 @@ def fetch_eastmoney_holdings(
     timeout: float = 30,
     request_interval: float = 0.5,
     include_report_dates: bool = False,
+    retry_attempts: int = 2,
+    retry_backoff: float = 1.5,
 ) -> list[dict]:
     code = str(fund_code).strip()
     if not (len(code) == 6 and code.isascii() and code.isdigit()):
         raise ValueError("基金代码必须是 6 位数字")
     year_value = int(year)
-    params = {
-        "type": "jjcc",
-        "code": code,
-        "topline": "10000",
-        "year": str(year_value),
-        "month": "",
-        "rt": str(time.time()),
-    }
-    request = Request(
-        f"{EASTMONEY_HOLDING_URL}?{urlencode(params)}",
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
-            "Referer": f"https://fundf10.eastmoney.com/jjcc_{code}.html",
-            "Accept": "*/*",
-        },
-    )
-    try:
-        _wait_request_slot(request_interval)
-        with opener(request, timeout=timeout) as response:
-            payload = response.read()
-        if isinstance(payload, bytes):
-            payload = payload.decode("utf-8-sig", errors="replace")
-        rows = parse_eastmoney_holding_response(
-            payload,
-            code,
-            exchange=exchange,
-            fund_name=fund_name,
-            available_date=available_date,
-            year=year_value,
+    attempts = max(1, int(retry_attempts))
+    last_error: EastmoneyHoldingError | None = None
+    for attempt in range(attempts):
+        params = {
+            "type": "jjcc",
+            "code": code,
+            "topline": "10000",
+            "year": str(year_value),
+            "month": "",
+            # Each retry gets a fresh cache-busting value.
+            "rt": str(time.time()),
+        }
+        request = Request(
+            f"{EASTMONEY_HOLDING_URL}?{urlencode(params)}",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+                "Referer": f"https://fundf10.eastmoney.com/jjcc_{code}.html",
+                "Accept": "*/*",
+            },
         )
-        if include_report_dates:
-            try:
-                report_dates = fetch_eastmoney_report_dates(
-                    code,
-                    opener=opener,
-                    timeout=timeout,
-                    request_interval=request_interval,
-                )
-                for row in rows:
-                    row["可用日期"] = report_dates.get(row["报告期"])
-            except EastmoneyHoldingError:
-                # 持仓接口成功时公告日期允许为空，避免因公告接口单独波动丢失持仓。
-                pass
-        return rows
-    except EastmoneyHoldingError:
-        raise
-    except Exception as exc:
-        raise EastmoneyHoldingError(f"{code} {year_value} 年度持仓请求失败: {exc}") from exc
+        try:
+            _wait_request_slot(request_interval)
+            with opener(request, timeout=timeout) as response:
+                payload = response.read()
+            if isinstance(payload, bytes):
+                payload = payload.decode("utf-8-sig", errors="replace")
+            rows = parse_eastmoney_holding_response(
+                payload,
+                code,
+                exchange=exchange,
+                fund_name=fund_name,
+                available_date=available_date,
+                year=year_value,
+            )
+            if include_report_dates:
+                try:
+                    report_dates = fetch_eastmoney_report_dates(
+                        code,
+                        opener=opener,
+                        timeout=timeout,
+                        request_interval=request_interval,
+                    )
+                    for row in rows:
+                        row["可用日期"] = report_dates.get(row["报告期"])
+                except EastmoneyHoldingError:
+                    # 持仓接口成功时公告日期允许为空，避免因公告接口单独波动丢失持仓。
+                    pass
+            return rows
+        except EastmoneyHoldingError as exc:
+            last_error = exc
+        except Exception as exc:
+            last_error = EastmoneyHoldingError(f"{code} {year_value} 年度持仓请求失败: {exc}")
+        if attempt + 1 < attempts and retry_backoff > 0:
+            time.sleep(retry_backoff * (attempt + 1))
+    if last_error is not None:
+        raise last_error
+    raise EastmoneyHoldingError(f"{code} {year_value} 年度持仓请求失败")
 
 
 def fetch_eastmoney_report_dates(

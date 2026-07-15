@@ -705,7 +705,7 @@ class ETFApp:
                 except EastmoneyHoldingNoDataError as exc:
                     completed += 1
                     completed_tasks.add(task)
-                    self.log(f"基金季度持仓 {fund_code} {year} 年无股票持仓，已跳过：{exc}")
+                    self.log(f"基金季度持仓 {fund_code} {year} 年重试后仍无股票持仓，已跳过：{exc}")
                     if completed == 1 or completed % 25 == 0 or completed == len(tasks):
                         self.log(f"基金季度持仓进度 {completed}/{len(tasks)}，最近跳过 {fund_code} {year} 年。")
                 except EastmoneyHoldingError as exc:
@@ -1277,7 +1277,7 @@ class ETFApp:
                 except EastmoneyHoldingNoDataError as exc:
                     completed += 1
                     completed_tasks.add(task)
-                    self.log(f"季度持仓续采 {fund_code} {year} 年无股票持仓，已跳过：{exc}")
+                    self.log(f"季度持仓续采 {fund_code} {year} 年重试后仍无股票持仓，已跳过：{exc}")
                 except Exception as exc:
                     self.paused_holding_task = {
                         "tasks": [item for item in tasks if item not in completed_tasks],

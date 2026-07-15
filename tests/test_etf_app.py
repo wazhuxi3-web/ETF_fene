@@ -134,6 +134,50 @@ class EastmoneyHoldingParserTests(unittest.TestCase):
         self.assertIn("year=2024", request.full_url)
         self.assertEqual(len(rows), 2)
 
+    def test_retries_transient_no_data_response(self):
+        def response(payload):
+            item = Mock()
+            item.read.return_value = payload.encode("utf-8")
+            item.__enter__ = Mock(return_value=item)
+            item.__exit__ = Mock(return_value=False)
+            return item
+
+        opener = Mock(side_effect=[
+            response('var apidata={content:"<p>\\u6682\\u65e0\\u6570\\u636e</p>"};'),
+            response(self._response()),
+        ])
+        rows = fetch_eastmoney_holdings(
+            "510010",
+            2024,
+            opener=opener,
+            request_interval=0,
+            retry_attempts=2,
+            retry_backoff=0,
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(opener.call_count, 2)
+
+    def test_preserves_columns_when_related_links_cell_is_malformed(self):
+        response = (
+            '<h4>2024\u5e741\u5b63\u5ea6\u80a1\u7968\u6295\u8d44\u660e\u7ec6</h4>'
+            '<table><tr><th>\u5e8f\u53f7</th><th>\u80a1\u7968\u4ee3\u7801</th>'
+            '<th>\u80a1\u7968\u540d\u79f0</th><th>\u76f8\u5173\u8d44\u8baf</th>'
+            '<th>\u5360\u51c0\u503c\u6bd4\u4f8b</th><th>\u6301\u80a1\u6570</th>'
+            '<th>\u6301\u4ed3\u5e02\u503c</th></tr>'
+            '<tr><td>1</td><td><span>400174</span></td><td><span>\u4e2d\u8bc13</span></td>'
+            '<td class="xglj"><span>\u80a1\u5427</span><span>\u884c\u60c5</span><span>\u6863\u6848'
+            '<td class="tor">0.13%</td><td class="tor">4,054.35</td>'
+            '<td class="tor">567.61</td></tr></table>'
+        )
+        rows = parse_eastmoney_holding_response(
+            'var apidata={content:' + json.dumps(response, ensure_ascii=False) + '};',
+            "512200",
+        )
+        self.assertEqual(rows[0]["股票代码"], "400174")
+        self.assertEqual(rows[0]["占净值比例"], 0.13)
+        self.assertEqual(rows[0]["持股数"], 40543500.0)
+        self.assertEqual(rows[0]["持仓市值"], 5676100.0)
+
 
 class PCFNormalizationTests(unittest.TestCase):
     def test_normalizes_info_with_chinese_columns_and_null_missing_values(self):
