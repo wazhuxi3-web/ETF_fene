@@ -1316,7 +1316,38 @@ class ETFApp:
             self.log("  " + line)
 
     def _refresh_stats(self):
+        if hasattr(self, "root") and hasattr(self, "coverage_vars"):
+            if getattr(self, "_stats_loading", False):
+                return
+            self._stats_loading = True
+            for variable in self.coverage_vars.values():
+                variable.set("统计加载中...")
+
+            def load_coverage():
+                try:
+                    coverage = self.db.get_collection_coverage()
+                    error = None
+                except Exception as exc:
+                    coverage = None
+                    error = exc
+                try:
+                    self.root.after(0, lambda: self._apply_coverage(coverage, error))
+                except Exception:
+                    pass
+
+            threading.Thread(target=load_coverage, daemon=True).start()
+            return
+
         coverage = self.db.get_collection_coverage()
+        self._apply_coverage(coverage, None)
+
+    def _apply_coverage(self, coverage, error):
+        self._stats_loading = False
+        if error is not None:
+            for variable in self.coverage_vars.values():
+                variable.set("读取失败")
+            self.log(f"覆盖范围统计失败：{error}")
+            return
         for kind in ("share", "component", "holding"):
             for exchange in ("SSE", "SZSE"):
                 variable = self.coverage_vars.get((kind, exchange))

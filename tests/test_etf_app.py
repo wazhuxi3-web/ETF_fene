@@ -2309,8 +2309,11 @@ class PCFDatabaseTests(unittest.TestCase):
 
             self.assertIn("基金代码", info_columns)
             self.assertIn("内容日期", info_columns)
-            self.assertIn("证券代码", item_columns)
-            self.assertIn("挂牌市场", item_columns)
+            self.assertIn("日期", item_columns)
+            self.assertIn("基金名称", item_columns)
+            self.assertIn("市场", item_columns)
+            self.assertIn("成分股代码", item_columns)
+            self.assertIn("现金替代标志含义", item_columns)
 
     def test_upsert_is_idempotent_and_complete_check_is_per_fund_date(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2332,6 +2335,62 @@ class PCFDatabaseTests(unittest.TestCase):
                 item_count = conn.execute("SELECT COUNT(*) FROM ETF_ITEM").fetchone()[0]
             self.assertEqual(info_count, 1)
             self.assertEqual(item_count, 1)
+
+    def test_writes_flattened_item_fields_for_sse_and_szse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = ETFDatabase(Path(tmp) / "stock_data.db")
+            db.initialize()
+            sse_info = self._info("2026-07-13")
+            sse_item = self._item("600009", "2026-07-13")
+            szse_info = {
+                **self._info("2026-07-14"),
+                "交易所": "SZSE",
+                "基金代码": "159915",
+                "基金名称": "创业板ETF",
+                "基金份额净值": 2.5,
+                "最小申购、赎回单位": 500000.0,
+            }
+            szse_item = {
+                **self._item("300001", "2026-07-14"),
+                "交易所": "SZSE",
+                "基金代码": "159915",
+                "证券简称": "特锐德",
+                "股票数量": 1200,
+                "现金替代标志": "必须现金替代",
+                "挂牌市场": "深圳证券交易所",
+            }
+
+            db.replace_pcf_snapshot(sse_info, [sse_item])
+            db.replace_pcf_snapshot(szse_info, [szse_item])
+
+            with closing(db.connect()) as conn:
+                rows = conn.execute(
+                    '''SELECT "日期", "基金代码", "基金名称", "市场", "申赎单位",
+                              "单位净值", "预估现金差额", "最大现金替代比例",
+                              "成分股代码", "成分股名称", "数量", "现金替代标志",
+                              "现金替代标志含义", "申购现金替代溢价比例",
+                              "赎回现金替代折价比例", source
+                       FROM ETF_ITEM ORDER BY "基金代码"'''
+                ).fetchall()
+
+            self.assertEqual(len(rows), 2)
+            rows_by_code = {row[1]: tuple(row) for row in rows}
+            self.assertEqual(
+                rows_by_code["510010"],
+                (
+                    "2026-07-13", "510010", "治理ETF", "上海证券交易所",
+                    1000000.0, 1.68, 100.0, 30.0, "600009", "上海机场",
+                    300.0, 1, "允许", 34.0, 0.0, "sse_pcf",
+                ),
+            )
+            self.assertEqual(
+                rows_by_code["159915"],
+                (
+                    "2026-07-14", "159915", "创业板ETF", "深圳证券交易所",
+                    500000.0, 2.5, 100.0, 30.0, "300001", "特锐德",
+                    1200.0, 2, "必须现金替代", 34.0, 0.0, "sse_pcf",
+                ),
+            )
 
     def test_incomplete_pcf_is_not_skipped(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2396,20 +2455,20 @@ class PCFDatabaseTests(unittest.TestCase):
 
             with closing(db.connect()) as conn:
                 current_codes = [
-                    row["证券代码"]
+                    row["成分股代码"]
                     for row in conn.execute(
-                        'SELECT "证券代码" FROM ETF_ITEM '
-                        'WHERE "交易所" = ? AND "基金代码" = ? AND "内容日期" = ? '
-                        'ORDER BY "证券代码"',
-                        ("SZSE", "159915", "2026-07-14"),
+                        'SELECT "成分股代码" FROM ETF_ITEM '
+                        'WHERE "基金代码" = ? AND "日期" = ? '
+                        'ORDER BY "成分股代码"',
+                        ("159915", "2026-07-14"),
                     )
                 ]
                 old_codes = [
-                    row["证券代码"]
+                    row["成分股代码"]
                     for row in conn.execute(
-                        'SELECT "证券代码" FROM ETF_ITEM '
-                        'WHERE "交易所" = ? AND "基金代码" = ? AND "内容日期" = ? ',
-                        ("SZSE", "159915", "2026-07-13"),
+                        'SELECT "成分股代码" FROM ETF_ITEM '
+                        'WHERE "基金代码" = ? AND "日期" = ? ',
+                        ("159915", "2026-07-13"),
                     )
                 ]
                 info_source = conn.execute(
@@ -2417,8 +2476,8 @@ class PCFDatabaseTests(unittest.TestCase):
                     ("SZSE", "159915", "2026-07-14"),
                 ).fetchone()["source"]
                 item_source = conn.execute(
-                    'SELECT source FROM ETF_ITEM WHERE "交易所" = ? AND "基金代码" = ? AND "内容日期" = ?',
-                    ("SZSE", "159915", "2026-07-14"),
+                    'SELECT source FROM ETF_ITEM WHERE "基金代码" = ? AND "日期" = ?',
+                    ("159915", "2026-07-14"),
                 ).fetchone()["source"]
 
             self.assertTrue(db.pcf_is_complete("SZSE", "159915", "2026-07-14"))
@@ -2444,7 +2503,7 @@ class PCFDatabaseTests(unittest.TestCase):
             with closing(db.connect()) as conn:
                 conn.execute(
                     '''CREATE TRIGGER fail_replacement_item BEFORE INSERT ON ETF_ITEM
-                    WHEN NEW."证券代码" = '300002'
+                    WHEN NEW."成分股代码" = '300002'
                     BEGIN SELECT RAISE(ABORT, 'forced item insert failure'); END'''
                 )
                 conn.commit()
@@ -2455,9 +2514,9 @@ class PCFDatabaseTests(unittest.TestCase):
 
             with closing(db.connect()) as conn:
                 item_rows = conn.execute(
-                    'SELECT "证券代码", source FROM ETF_ITEM '
-                    'WHERE "交易所" = ? AND "基金代码" = ? AND "内容日期" = ?',
-                    ("SZSE", "159915", "2026-07-14"),
+                    'SELECT "成分股代码", source FROM ETF_ITEM '
+                    'WHERE "基金代码" = ? AND "日期" = ?',
+                    ("159915", "2026-07-14"),
                 ).fetchall()
                 info_row = conn.execute(
                     'SELECT "基金名称", source FROM ETF_INFO '
@@ -2465,7 +2524,7 @@ class PCFDatabaseTests(unittest.TestCase):
                     ("SZSE", "159915", "2026-07-14"),
                 ).fetchone()
 
-            self.assertEqual([(row["证券代码"], row["source"]) for row in item_rows], [("300001", "original")])
+            self.assertEqual([(row["成分股代码"], row["source"]) for row in item_rows], [("300001", "original")])
             self.assertEqual((info_row["基金名称"], info_row["source"]), (info["基金名称"], "original"))
 
     def test_lists_distinct_fund_codes_for_pcf_batch(self):
