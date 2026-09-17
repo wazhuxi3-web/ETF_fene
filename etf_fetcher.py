@@ -28,6 +28,7 @@ HEADERS = {
 
 PAGE_URL = "https://www.sse.com.cn/market/funddata/volumn/etfvolumn/"
 SZSE_PAGE_URL = "https://www.szse.cn/market/fund/volume/etf/index.html"
+SSE_SHARE_MULTIPLIER = 10000
 
 
 class ETFNetworkError(RuntimeError):
@@ -134,7 +135,10 @@ def parse_sse_payload(text: str) -> list[dict]:
                     or item.get("fund_name")
                     or ""
                 ).strip(),
-                "total_share": float(str(share).replace(",", "")),
+                "total_share": float(str(share).replace(",", "")) * SSE_SHARE_MULTIPLIER,
+                "exchange": "SSE",
+                "share_unit": "share",
+                "source": "sse_commonQuery",
             }
         )
     return rows
@@ -155,7 +159,10 @@ def parse_sse_table_html(html: str) -> list[dict]:
                 "trade_date": date,
                 "fund_code": code,
                 "fund_name": name,
-                "total_share": float(share.replace(",", "")),
+                "total_share": float(share.replace(",", "")) * SSE_SHARE_MULTIPLIER,
+                "exchange": "SSE",
+                "share_unit": "share",
+                "source": "sse_table",
             }
         )
     return rows

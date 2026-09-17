@@ -1472,7 +1472,10 @@ class ParseSSEPayloadTests(unittest.TestCase):
                     "trade_date": "2026-07-06",
                     "fund_code": "510300",
                     "fund_name": "沪深300ETF华泰柏瑞",
-                    "total_share": 1682148.77,
+                    "total_share": 16821487700.0,
+                    "exchange": "SSE",
+                    "share_unit": "share",
+                    "source": "sse_commonQuery",
                 }
             ],
         )
@@ -1492,7 +1495,10 @@ class ParseSSEPayloadTests(unittest.TestCase):
                     "trade_date": "2026-07-06",
                     "fund_code": "510300",
                     "fund_name": "沪深300ETF华泰柏瑞",
-                    "total_share": 1682148.77,
+                    "total_share": 16821487700.0,
+                    "exchange": "SSE",
+                    "share_unit": "share",
+                    "source": "sse_table",
                 }
             ],
         )
