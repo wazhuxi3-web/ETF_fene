@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 etf_crash.log
 etf_runtime.log
+etf_startup.log
+etf_gui_config.json
 downloads/
 *.tmp
 .worktrees/

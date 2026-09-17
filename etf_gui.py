@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import faulthandler
+import json
 import os
 import sys
 import threading
@@ -9,7 +10,7 @@ import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from etf_database import DEFAULT_DB_PATH, ETFDatabase
 from etf_fetcher import (
@@ -42,7 +43,32 @@ from etf_web_app import parse_web_endpoint
 
 ETF_CRASH_LOG = Path(__file__).with_name("etf_crash.log")
 ETF_RUNTIME_LOG = Path(__file__).with_name("etf_runtime.log")
+ETF_CONFIG_PATH = Path(__file__).with_name("etf_gui_config.json")
 _FAULT_LOG_FILE = None
+
+
+def load_database_path(
+    config_path: str | Path = ETF_CONFIG_PATH,
+    default_path: str | Path = DEFAULT_DB_PATH,
+) -> Path:
+    try:
+        config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+        value = config.get("database_path") if isinstance(config, dict) else None
+        if isinstance(value, str) and value.strip():
+            return Path(value).expanduser()
+    except (OSError, TypeError, ValueError):
+        pass
+    return Path(default_path)
+
+
+def save_database_path(
+    db_path: str | Path,
+    config_path: str | Path = ETF_CONFIG_PATH,
+) -> None:
+    Path(config_path).write_text(
+        json.dumps({"database_path": str(Path(db_path))}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def _append_runtime_log(message: str) -> None:
@@ -173,9 +199,10 @@ class ETFApp:
         self.root.title("ETF份额采集与曲线")
         self.root.geometry("880x640")
         self.root.minsize(820, 600)
-        self.db = ETFDatabase(DEFAULT_DB_PATH)
+        self.db_path = load_database_path()
+        self.db = ETFDatabase(self.db_path)
         self.db.initialize()
-        self.server = ETFWebServer(DEFAULT_DB_PATH)
+        self.server = ETFWebServer(self.db_path)
         self.web_host_var = tk.StringVar(value="127.0.0.1")
         self.web_port_var = tk.StringVar(value="1234")
         self.exchange_var = tk.StringVar(value="上交所")
@@ -197,8 +224,18 @@ class ETFApp:
         frame = ttk.Frame(self.root, padding=12)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        db_text = f"数据库: {DEFAULT_DB_PATH}"
-        ttk.Label(frame, text=db_text).pack(anchor="w")
+        db_frame = ttk.Frame(frame)
+        db_frame.pack(fill=tk.X)
+        ttk.Label(db_frame, text="数据库").pack(side=tk.LEFT, padx=(0, 6))
+        self.db_path_var = tk.StringVar(value=str(self.db_path))
+        self.db_path_entry = ttk.Entry(
+            db_frame, textvariable=self.db_path_var, state="readonly"
+        )
+        self.db_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.db_path_button = ttk.Button(
+            db_frame, text="选择数据库", command=self.choose_database
+        )
+        self.db_path_button.pack(side=tk.LEFT, padx=(8, 0))
 
         today = datetime.now().strftime("%Y-%m-%d")
         last_month = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
@@ -437,6 +474,8 @@ class ETFApp:
             self.pcf_replace_check,
             self.start_collection_button,
             self.test_connection_button,
+            self.db_path_entry,
+            self.db_path_button,
         ]
         self._sync_collection_panel()
         self._update_continue_button()
@@ -531,7 +570,9 @@ class ETFApp:
         for widget in self.task_input_widgets:
             if busy:
                 widget.configure(state="disabled")
-            elif widget is self.exchange_combo:
+            elif widget is self.exchange_combo or widget is getattr(
+                self, "db_path_entry", None
+            ):
                 widget.configure(state="readonly")
             else:
                 widget.configure(state="normal")
@@ -1309,6 +1350,51 @@ class ETFApp:
 
         self.log(f"网页曲线已启动: {url}")
         self.server.open()
+
+    def choose_database(self):
+        if self.busy:
+            messagebox.showinfo("提示", "正在采集中，请先等待任务结束。")
+            return
+        if self.paused_task or self.paused_pcf_task or self.paused_holding_task:
+            messagebox.showinfo("提示", "当前有暂停任务，请先继续或结束任务后再切换数据库。")
+            return
+
+        selected = filedialog.askopenfilename(
+            title="选择 ETF 数据库",
+            initialdir=str(self.db_path.parent),
+            initialfile=self.db_path.name,
+            filetypes=[
+                ("SQLite 数据库", "*.db *.sqlite *.sqlite3"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if not selected:
+            return
+
+        new_path = Path(selected).expanduser().resolve()
+        if new_path == self.db_path.expanduser().resolve():
+            return
+        try:
+            new_db = ETFDatabase(new_path)
+            new_db.initialize()
+        except Exception as exc:
+            messagebox.showerror("数据库切换失败", f"无法打开数据库：{exc}")
+            return
+
+        try:
+            if self.server.server:
+                self.server.stop()
+            self.server.db_path = new_path
+            self.db_path = new_path
+            self.db = new_db
+            self.db_path_var.set(str(new_path))
+            save_database_path(new_path)
+        except Exception as exc:
+            messagebox.showerror("数据库切换失败", f"数据库已打开，但保存设置失败：{exc}")
+            self.log(f"数据库已切换，但保存路径设置失败：{exc}")
+        else:
+            self.log(f"数据库已切换：{new_path}")
+        self._refresh_stats()
 
     def diagnose(self):
         self.log("网络诊断:")

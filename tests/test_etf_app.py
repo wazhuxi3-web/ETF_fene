@@ -57,7 +57,13 @@ from szse_pcf_fetcher import (
     extract_szse_pcf_references,
     parse_szse_pcf_download,
 )
-from etf_gui import ETFApp, collection_panel_state, format_coverage_cell
+from etf_gui import (
+    ETFApp,
+    collection_panel_state,
+    format_coverage_cell,
+    load_database_path,
+    save_database_path,
+)
 from etf_web_app import ETFWebServer, HTML, parse_web_endpoint
 
 
@@ -3317,6 +3323,26 @@ class ETFWebServerTests(unittest.TestCase):
 
 
 class ETFGuiTests(unittest.TestCase):
+    def test_database_path_config_round_trip_and_invalid_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "etf_gui_config.json"
+            default_path = Path(tmp) / "default.db"
+            selected_path = Path(tmp) / "selected.db"
+
+            self.assertEqual(load_database_path(config_path, default_path), default_path)
+            save_database_path(selected_path, config_path)
+            self.assertEqual(load_database_path(config_path, default_path), selected_path)
+
+            config_path.write_text("{bad json", encoding="utf-8")
+            self.assertEqual(load_database_path(config_path, default_path), default_path)
+
+    def test_gui_contains_database_path_picker_and_runtime_switch(self):
+        source = Path("etf_gui.py").read_text(encoding="utf-8-sig")
+        self.assertIn("选择数据库", source)
+        self.assertIn("filedialog.askopenfilename", source)
+        self.assertIn("self.server.db_path = new_path", source)
+        self.assertIn("save_database_path(new_path)", source)
+
     def test_gui_contains_exchange_selector_and_szse_dispatch(self):
         source = Path("etf_gui.py").read_text(encoding="utf-8")
 
