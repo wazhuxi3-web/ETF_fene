@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 DEFAULT_DB_PATH = Path(r"E:\学习\交易\stock_data\stock_data.db")
+DEFAULT_SHARE_UNIT = "份"
 
 
 PCF_INFO_COLUMNS = (
@@ -46,6 +47,13 @@ class ETFDatabase:
         conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
+
+    @staticmethod
+    def _normalize_share_unit(value: object) -> str:
+        text = str(value or "").strip()
+        if not text or text.lower() in {"share", "shares"}:
+            return DEFAULT_SHARE_UNIT
+        return text
 
     @staticmethod
     def _etf_item_schema(conn: sqlite3.Connection) -> str:
@@ -147,7 +155,7 @@ class ETFDatabase:
                 fund_name TEXT NOT NULL,
                 total_share REAL NOT NULL,
                 share_delta REAL,
-                share_unit TEXT NOT NULL DEFAULT 'share',
+                share_unit TEXT NOT NULL DEFAULT '份',
                 source TEXT NOT NULL DEFAULT 'sse_commonQuery',
                 updated_at TEXT NOT NULL,
                 UNIQUE(trade_date, exchange, fund_code)
@@ -171,14 +179,26 @@ class ETFDatabase:
         )
         if not needs_rebuild:
             conn.execute("UPDATE ETF SET exchange = 'SSE' WHERE exchange IS NULL OR exchange = ''")
-            conn.execute("UPDATE ETF SET share_unit = 'share' WHERE share_unit IS NULL OR share_unit = ''")
+            conn.execute(
+                """
+                UPDATE ETF
+                SET share_unit = '份'
+                WHERE share_unit IS NULL OR share_unit = ''
+                   OR lower(share_unit) IN ('share', 'shares')
+                """
+            )
             return
 
         conn.execute("ALTER TABLE ETF RENAME TO ETF_legacy")
         self._create_etf_table(conn)
         source_expr = '"source"' if "source" in columns else "'sse_commonQuery'"
         exchange_expr = '"exchange"' if "exchange" in columns else "'SSE'"
-        unit_expr = '"share_unit"' if "share_unit" in columns else "'share'"
+        unit_expr = '"share_unit"' if "share_unit" in columns else "'份'"
+        unit_value_expr = f"COALESCE({unit_expr}, '份')"
+        normalized_unit_expr = (
+            f"CASE WHEN lower({unit_value_expr}) IN ('share', 'shares') "
+            f"THEN '份' ELSE {unit_value_expr} END"
+        )
         conn.execute(
             f"""
             INSERT INTO ETF (
@@ -186,7 +206,7 @@ class ETFDatabase:
                 share_delta, share_unit, source, updated_at
             )
             SELECT id, trade_date, COALESCE({exchange_expr}, 'SSE'), fund_code,
-                   fund_name, total_share, share_delta, COALESCE({unit_expr}, 'share'),
+                   fund_name, total_share, share_delta, {normalized_unit_expr},
                    COALESCE({source_expr}, 'sse_commonQuery'), updated_at
             FROM ETF_legacy
             """
@@ -560,7 +580,7 @@ class ETFDatabase:
                 str(row["fund_code"]).strip(),
                 str(row.get("fund_name") or "").strip(),
                 float(row["total_share"]),
-                str(row.get("share_unit") or "share").strip(),
+                self._normalize_share_unit(row.get("share_unit")),
                 str(
                     row.get("source")
                     or ("szse_report" if str(row.get("exchange") or "SSE").upper() == "SZSE" else "sse_commonQuery")
@@ -643,7 +663,7 @@ class ETFDatabase:
                 rows = conn.execute(
                     """
                     SELECT trade_date, exchange, fund_code, fund_name,
-                           total_share, COALESCE(NULLIF(share_unit, ''), 'share') AS share_unit
+                           total_share, COALESCE(NULLIF(share_unit, ''), '份') AS share_unit
                     FROM ETF
                     WHERE trade_date BETWEEN ? AND ?
                       AND exchange IN ('SSE', 'SZSE')
@@ -677,7 +697,7 @@ class ETFDatabase:
                             str(row["fund_code"]),
                             str(row["fund_name"] or ""),
                             row["total_share"],
-                            str(row["share_unit"] or "share"),
+                            self._normalize_share_unit(row["share_unit"]),
                         ]
                     )
                     current_rows += 1

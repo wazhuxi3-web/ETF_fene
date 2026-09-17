@@ -1474,7 +1474,7 @@ class ParseSSEPayloadTests(unittest.TestCase):
                     "fund_name": "沪深300ETF华泰柏瑞",
                     "total_share": 16821487700.0,
                     "exchange": "SSE",
-                    "share_unit": "share",
+                    "share_unit": "份",
                     "source": "sse_commonQuery",
                 }
             ],
@@ -1497,7 +1497,7 @@ class ParseSSEPayloadTests(unittest.TestCase):
                     "fund_name": "沪深300ETF华泰柏瑞",
                     "total_share": 16821487700.0,
                     "exchange": "SSE",
-                    "share_unit": "share",
+                    "share_unit": "份",
                     "source": "sse_table",
                 }
             ],
@@ -1534,7 +1534,7 @@ class ParseSZSEPayloadTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["total_share"], 16703400.0)
         self.assertEqual(rows[0]["exchange"], "SZSE")
-        self.assertEqual(rows[0]["share_unit"], "share")
+        self.assertEqual(rows[0]["share_unit"], "份")
 
     def test_splits_szse_ranges_into_at_most_six_months(self):
         ranges = list(split_date_ranges("2025-01-01", "2026-07-08"))
@@ -2019,6 +2019,29 @@ class ETFDatabaseTests(unittest.TestCase):
             self.assertEqual(len(latest), 1)
             self.assertEqual(latest[0]["total_share"], 126.0)
 
+    def test_normalizes_english_share_unit_to_chinese_unit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = ETFDatabase(Path(tmp) / "stock_data.db")
+            db.initialize()
+            db.upsert_rows(
+                [
+                    {
+                        "trade_date": "2026-09-16",
+                        "exchange": "SSE",
+                        "fund_code": "510300",
+                        "fund_name": "ETF A",
+                        "total_share": 100.0,
+                        "share_unit": "share",
+                    }
+                ]
+            )
+
+            with closing(db.connect()) as conn:
+                unit = conn.execute(
+                    "SELECT share_unit FROM ETF WHERE fund_code = '510300'"
+                ).fetchone()["share_unit"]
+            self.assertEqual(unit, "份")
+
     def test_exports_share_rows_by_date_and_exchange(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2085,7 +2108,7 @@ class ETFDatabaseTests(unittest.TestCase):
                 rows,
                 [
                     ["统计日期", "交易所", "基金代码", "基金简称", "基金份额", "单位"],
-                    ["2026-09-15", "SSE", "510300", "沪深300ETF", "100.0", "share"],
+                    ["2026-09-15", "SSE", "510300", "沪深300ETF", "100.0", "份"],
                 ],
             )
 

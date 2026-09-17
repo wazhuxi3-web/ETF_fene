@@ -96,7 +96,7 @@ def parse_szse_download_file(path: str | Path) -> list[dict]:
                 "fund_name": _clean_text(item[name_col]),
                 "total_share": _to_float(share) * multiplier,
                 "exchange": "SZSE",
-                "share_unit": "share",
+                "share_unit": "份",
                 "source": "szse_download",
             }
         )

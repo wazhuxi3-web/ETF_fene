@@ -57,7 +57,7 @@ def parse_szse_payload(text: str) -> list[dict]:
                 "fund_name": str(item.get("security_short_name") or "").strip(),
                 "total_share": float(str(share).replace(",", "")) * 10000,
                 "exchange": "SZSE",
-                "share_unit": "share",
+                "share_unit": "份",
                 "source": "szse_report",
             }
         )
@@ -137,7 +137,7 @@ def parse_sse_payload(text: str) -> list[dict]:
                 ).strip(),
                 "total_share": float(str(share).replace(",", "")) * SSE_SHARE_MULTIPLIER,
                 "exchange": "SSE",
-                "share_unit": "share",
+                "share_unit": "份",
                 "source": "sse_commonQuery",
             }
         )
@@ -161,7 +161,7 @@ def parse_sse_table_html(html: str) -> list[dict]:
                 "fund_name": name,
                 "total_share": float(share.replace(",", "")) * SSE_SHARE_MULTIPLIER,
                 "exchange": "SSE",
-                "share_unit": "share",
+                "share_unit": "份",
                 "source": "sse_table",
             }
         )
