@@ -242,6 +242,9 @@ class ETFApp:
         self.date_var = tk.StringVar(value=today)
         self.start_var = tk.StringVar(value=last_month)
         self.end_var = tk.StringVar(value=today)
+        self.export_start_var = tk.StringVar(value=last_month)
+        self.export_end_var = tk.StringVar(value=today)
+        self.export_dir_var = tk.StringVar()
         self.holding_start_year_var = tk.StringVar(value="2016")
         self.holding_end_year_var = tk.StringVar(value=str(datetime.now().year))
         self.workers_var = tk.StringVar(value="16")
@@ -425,6 +428,42 @@ class ETFApp:
                     textvariable=self.coverage_vars[(kind, exchange)],
                 ).grid(row=row, column=column, sticky="w", padx=4, pady=2)
 
+        export_form = ttk.LabelFrame(frame, text="ETF 份额导出", padding=10)
+        export_form.pack(fill=tk.X, pady=(0, 10))
+        export_form.columnconfigure(5, weight=1)
+        ttk.Label(export_form, text="日期范围").grid(
+            row=0, column=0, padx=(0, 4), pady=3, sticky="w"
+        )
+        self.export_start_entry = ttk.Entry(
+            export_form, textvariable=self.export_start_var, width=14
+        )
+        self.export_start_entry.grid(row=0, column=1, padx=4, pady=3, sticky="w")
+        ttk.Label(export_form, text="至").grid(row=0, column=2, padx=4, pady=3)
+        self.export_end_entry = ttk.Entry(
+            export_form, textvariable=self.export_end_var, width=14
+        )
+        self.export_end_entry.grid(row=0, column=3, padx=4, pady=3, sticky="w")
+        ttk.Label(export_form, text="导出目录").grid(
+            row=0, column=4, padx=(14, 4), pady=3, sticky="w"
+        )
+        self.export_dir_entry = ttk.Entry(
+            export_form, textvariable=self.export_dir_var, state="readonly"
+        )
+        self.export_dir_entry.grid(row=0, column=5, padx=4, pady=3, sticky="ew")
+        self.export_dir_button = ttk.Button(
+            export_form, text="选择文件夹", command=self.choose_export_directory
+        )
+        self.export_dir_button.grid(row=0, column=6, padx=4, pady=3)
+        self.export_button = ttk.Button(
+            export_form, text="导出份额 CSV", command=self.start_share_export
+        )
+        self.export_button.grid(row=0, column=7, padx=(8, 0), pady=3)
+        ttk.Label(
+            export_form,
+            text="按日生成：YYYY-MM-DD_上交所.csv / YYYY-MM-DD_深交所.csv；无数据日期不生成空文件",
+            foreground="#666666",
+        ).grid(row=1, column=0, columnspan=8, sticky="w", pady=(3, 0))
+
         web_form = ttk.LabelFrame(frame, text="网页", padding=10)
         web_form.pack(fill=tk.X, pady=(0, 10))
         ttk.Label(web_form, text="地址").grid(row=0, column=0, padx=4, pady=4)
@@ -476,6 +515,11 @@ class ETFApp:
             self.test_connection_button,
             self.db_path_entry,
             self.db_path_button,
+            self.export_start_entry,
+            self.export_end_entry,
+            self.export_dir_entry,
+            self.export_dir_button,
+            self.export_button,
         ]
         self._sync_collection_panel()
         self._update_continue_button()
@@ -542,11 +586,11 @@ class ETFApp:
             return "网页"
         return "状态"
 
-    def _run(self, func):
+    def _run(self, func, busy_status="采集中"):
         if self.busy:
             messagebox.showinfo("提示", "正在采集中，请稍等。")
             return
-        self._set_busy_ui(True)
+        self._set_busy_ui(True, busy_status)
 
         def worker():
             try:
@@ -572,7 +616,7 @@ class ETFApp:
                 widget.configure(state="disabled")
             elif widget is self.exchange_combo or widget is getattr(
                 self, "db_path_entry", None
-            ):
+            ) or widget is getattr(self, "export_dir_entry", None):
                 widget.configure(state="readonly")
             else:
                 widget.configure(state="normal")
@@ -1334,6 +1378,58 @@ class ETFApp:
             executor.shutdown(wait=False, cancel_futures=True)
         if not self.paused_holding_task:
             self.log(f"季度持仓续采完成：处理 {completed} 个基金年度任务。")
+
+    def choose_export_directory(self):
+        current = Path(self.export_dir_var.get().strip()).expanduser()
+        initial_dir = current if current.is_dir() else self.db_path.parent
+        selected = filedialog.askdirectory(
+            title="选择 ETF 份额导出目录",
+            initialdir=str(initial_dir),
+            mustexist=True,
+        )
+        if selected:
+            self.export_dir_var.set(str(Path(selected).expanduser().resolve()))
+
+    def start_share_export(self):
+        start = self.export_start_var.get().strip()
+        end = self.export_end_var.get().strip()
+        try:
+            self._validate_date(start)
+            self._validate_date(end)
+        except ValueError:
+            messagebox.showerror("日期错误", "请输入 YYYY-MM-DD 格式的日期。")
+            return
+        if start > end:
+            messagebox.showerror("日期错误", "导出开始日期不能晚于结束日期。")
+            return
+
+        output_dir = Path(self.export_dir_var.get().strip()).expanduser()
+        if not self.export_dir_var.get().strip() or not output_dir.is_dir():
+            messagebox.showerror("导出目录错误", "请先选择一个存在的导出文件夹。")
+            return
+
+        self._run(
+            lambda: self._export_share_data(start, end, output_dir),
+            busy_status="导出中",
+        )
+
+    def _export_share_data(self, start: str, end: str, output_dir: Path):
+        self.log(f"开始导出 ETF 份额：{start} ~ {end}。")
+        self.log(f"导出目录：{output_dir}")
+        stats = self.db.export_share_csv_files(start, end, output_dir)
+        labels = {"SSE": "上交所", "SZSE": "深交所"}
+        total_files = 0
+        total_rows = 0
+        for exchange in ("SSE", "SZSE"):
+            files = stats[exchange]["files"]
+            rows = stats[exchange]["rows"]
+            total_files += files
+            total_rows += rows
+            self.log(f"{labels[exchange]}导出完成：{files} 个 CSV 文件，{rows} 行。")
+        if total_files:
+            self.log(f"ETF 份额导出完成：共 {total_files} 个文件，{total_rows} 行。")
+        else:
+            self.log("所选日期范围没有可导出的 ETF 份额数据。")
 
     def open_web(self):
         try:

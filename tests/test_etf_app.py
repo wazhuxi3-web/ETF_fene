@@ -1,3 +1,4 @@
+import csv
 import json
 import sqlite3
 import tempfile
@@ -2012,6 +2013,83 @@ class ETFDatabaseTests(unittest.TestCase):
             self.assertEqual(len(latest), 1)
             self.assertEqual(latest[0]["total_share"], 126.0)
 
+    def test_exports_share_rows_by_date_and_exchange(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = ETFDatabase(root / "stock_data.db")
+            db.initialize()
+            db.upsert_rows(
+                [
+                    {
+                        "trade_date": "2026-09-15",
+                        "exchange": "SSE",
+                        "fund_code": "510300",
+                        "fund_name": "沪深300ETF",
+                        "total_share": 100.0,
+                    },
+                    {
+                        "trade_date": "2026-09-15",
+                        "exchange": "SZSE",
+                        "fund_code": "159001",
+                        "fund_name": "货币ETF",
+                        "total_share": 200.5,
+                    },
+                    {
+                        "trade_date": "2026-09-16",
+                        "exchange": "SSE",
+                        "fund_code": "510300",
+                        "fund_name": "沪深300ETF",
+                        "total_share": 110.0,
+                    },
+                    {
+                        "trade_date": "2026-09-17",
+                        "exchange": "SSE",
+                        "fund_code": "510300",
+                        "fund_name": "沪深300ETF",
+                        "total_share": 120.0,
+                    },
+                ]
+            )
+
+            output_dir = root / "export"
+            stats = db.export_share_csv_files(
+                "2026-09-15", "2026-09-16", output_dir
+            )
+
+            self.assertEqual(
+                stats,
+                {
+                    "SSE": {"files": 2, "rows": 2},
+                    "SZSE": {"files": 1, "rows": 1},
+                },
+            )
+            self.assertEqual(
+                sorted(path.name for path in output_dir.iterdir()),
+                [
+                    "2026-09-15_上交所.csv",
+                    "2026-09-15_深交所.csv",
+                    "2026-09-16_上交所.csv",
+                ],
+            )
+            with (output_dir / "2026-09-15_上交所.csv").open(
+                encoding="utf-8-sig", newline=""
+            ) as file:
+                rows = list(csv.reader(file))
+            self.assertEqual(
+                rows,
+                [
+                    ["统计日期", "交易所", "基金代码", "基金简称", "基金份额", "单位"],
+                    ["2026-09-15", "SSE", "510300", "沪深300ETF", "100.0", "share"],
+                ],
+            )
+
+            with (output_dir / "2026-09-15_深交所.csv").open(
+                encoding="utf-8-sig", newline=""
+            ) as file:
+                szse_rows = list(csv.reader(file))
+            self.assertEqual(szse_rows[1][1], "SZSE")
+            self.assertEqual(szse_rows[1][4], "200.5")
+
     def test_can_defer_delta_recalculation_for_batch_import(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = ETFDatabase(Path(tmp) / "stock_data.db")
@@ -3342,6 +3420,14 @@ class ETFGuiTests(unittest.TestCase):
         self.assertIn("filedialog.askopenfilename", source)
         self.assertIn("self.server.db_path = new_path", source)
         self.assertIn("save_database_path(new_path)", source)
+
+    def test_gui_contains_share_csv_export_controls(self):
+        source = Path("etf_gui.py").read_text(encoding="utf-8-sig")
+
+        self.assertIn("export_share_csv_files", source)
+        self.assertIn("filedialog.askdirectory", source)
+        self.assertIn("export_start_var", source)
+        self.assertIn("YYYY-MM-DD_上交所.csv", source)
 
     def test_gui_contains_exchange_selector_and_szse_dispatch(self):
         source = Path("etf_gui.py").read_text(encoding="utf-8")

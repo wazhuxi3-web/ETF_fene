@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import sqlite3
 from contextlib import closing
 from datetime import datetime
@@ -592,6 +593,98 @@ class ETFDatabase:
             conn.commit()
 
         return len(normalized)
+
+    def export_share_csv_files(
+        self,
+        start_date: str,
+        end_date: str,
+        output_dir: str | Path,
+    ) -> dict[str, dict[str, int]]:
+        """按交易日和交易所导出 ETF 份额 CSV 文件。
+
+        每个有数据的日期会生成最多两个文件，例如
+        ``2026-09-16_上交所.csv`` 和 ``2026-09-16_深交所.csv``。
+        同名文件会被本次导出覆盖；没有份额数据的日期不会生成空文件。
+        """
+        try:
+            start = datetime.strptime(str(start_date).strip(), "%Y-%m-%d").date()
+            end = datetime.strptime(str(end_date).strip(), "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise ValueError("导出日期必须是 YYYY-MM-DD 格式") from exc
+        if start > end:
+            raise ValueError("导出开始日期不能晚于结束日期")
+
+        target_dir = Path(output_dir).expanduser()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        exchange_names = {"SSE": "上交所", "SZSE": "深交所"}
+        result = {
+            exchange: {"files": 0, "rows": 0}
+            for exchange in exchange_names
+        }
+        headers = ["统计日期", "交易所", "基金代码", "基金简称", "基金份额", "单位"]
+        current_key = None
+        current_exchange = None
+        current_file = None
+        current_rows = 0
+
+        def close_current_file() -> None:
+            nonlocal current_file, current_exchange, current_rows
+            if current_file is None:
+                return
+            current_file.close()
+            result[current_exchange]["files"] += 1
+            result[current_exchange]["rows"] += current_rows
+            current_file = None
+            current_exchange = None
+            current_rows = 0
+
+        try:
+            with closing(self.connect()) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT trade_date, exchange, fund_code, fund_name,
+                           total_share, COALESCE(NULLIF(share_unit, ''), 'share') AS share_unit
+                    FROM ETF
+                    WHERE trade_date BETWEEN ? AND ?
+                      AND exchange IN ('SSE', 'SZSE')
+                    ORDER BY trade_date ASC,
+                             CASE exchange WHEN 'SSE' THEN 0 ELSE 1 END,
+                             fund_code ASC
+                    """,
+                    (start.isoformat(), end.isoformat()),
+                )
+                for row in rows:
+                    trade_date = str(row["trade_date"])
+                    exchange = str(row["exchange"]).strip().upper()
+                    key = (trade_date, exchange)
+                    if key != current_key:
+                        close_current_file()
+                        file_path = target_dir / (
+                            f"{trade_date}_{exchange_names[exchange]}.csv"
+                        )
+                        current_file = file_path.open(
+                            "w", encoding="utf-8-sig", newline=""
+                        )
+                        csv_writer = csv.writer(current_file)
+                        csv_writer.writerow(headers)
+                        current_key = key
+                        current_exchange = exchange
+                        current_rows = 0
+                    csv_writer.writerow(
+                        [
+                            trade_date,
+                            exchange,
+                            str(row["fund_code"]),
+                            str(row["fund_name"] or ""),
+                            row["total_share"],
+                            str(row["share_unit"] or "share"),
+                        ]
+                    )
+                    current_rows += 1
+        finally:
+            close_current_file()
+
+        return result
 
     def recalculate_deltas(self, fund_codes: list[str]) -> None:
         codes = sorted({str(code).strip() for code in fund_codes if str(code).strip()})
